@@ -21,11 +21,10 @@ To run this project, ensure you have the following:
 ### 1. Clone the Repository
 Clone the project repository to your local machine:
 ```bash
-git clone https://github.com/hacktivist211/tts-llm-agent.git
-cd tts-llm-agent
+git [clone https://github.com/hacktivist211/tts-llm-agent.git](https://github.com/hacktivist211/tts_loop_agent.git)
+cd tts_loop_agent
 ```
 
-*Note*: If the repository URL is incorrect, replace `hacktivist211` with the correct GitHub username or repository path.
 
 ### 2. Create and Activate a Conda Environment
 Create a Conda environment to manage dependencies:
