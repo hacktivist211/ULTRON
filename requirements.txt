@@ -1,0 +1,69 @@
+# ============================================================================
+# IRIS — Unified Requirements File
+# Python Target: 3.11
+# Install:
+#   pip install -r requirements.txt
+#   pip install -e CosyVoice/third_party/Matcha-TTS
+#   conda install -c conda-forge pynini -y
+# ============================================================================
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# ---- Core & Math -----------------------------------------------------------
+requests>=2.31,<3
+numpy>=1.26.4,<2.0
+urllib3>=2.0,<3
+pyarrow>=14.0.0
+
+# ---- PyTorch Stack (CUDA 12.4) ---------------------------------------------
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
+torchvision==0.21.0+cu124
+
+# ---- Hugging Face Ecosystem (Pinned to avoid legacy cached_download crash) --
+huggingface-hub==0.24.7
+transformers==4.44.2
+tokenizers==0.19.1
+sentencepiece>=0.1.99,<0.2
+
+# ---- Voice: CosyVoice2 & Audio Processing ----------------------------------
+modelscope>=1.14.0
+hyperpyyaml>=1.2,<2
+conformer>=0.3,<0.4
+librosa>=0.10,<0.11
+inflect>=7.0,<8
+onnxruntime-gpu>=1.18,<2
+protobuf>=4.25,<6
+pyworld>=0.3.4,<1
+ruamel.yaml>=0.18,<1
+omegaconf>=2.3,<3
+soundfile>=0.12,<1
+tqdm>=4.66,<5
+g2p_en>=2.1.0
+WeTextProcessing>=1.0,<2
+sounddevice>=0.4.6,<0.5
+
+# ---- ASR / Transcription ---------------------------------------------------
+openai-whisper>=20231117
+faster-whisper>=1.0,<2
+ctranslate2>=4.3,<5
+
+# ---- Memory & Vector Embeddings --------------------------------------------
+sentence-transformers>=3.0,<6
+
+# ---- Web Search ------------------------------------------------------------
+tavily-python>=0.5,<1
+
+# ---- LangChain / Utilities ------------------------------------------------
+langchain>=0.3.14,<0.4
+langchain-core>=0.3.29,<0.4
+langchain-community>=0.3,<0.4
+langchain-text-splitters>=0.3,<0.4
+langchain-chroma>=0.2,<0.3
+chromadb>=0.5.18,<0.6
+pydantic>=2.5,<3
+pymupdf>=1.24,<2
+duckduckgo-search>=6.3,<9
+rich>=13.7,<15
+chardet>=5.2,<6
+pillow>=10.0,<12
