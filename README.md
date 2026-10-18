@@ -1,134 +1,67 @@
-# TTS LLM Agent
+# IRIS: Local Self-Corrective Voice Assistant & Memory Architecture
 
-A Python-based conversational AI agent integrating **Text-to-Speech (TTS)**, **Speech-to-Text (STT)**, and a **Large Language Model (LLM)** with smart web search capabilities. The agent, inspired by JARVIS, supports voice and text input, generates spoken responses, and automatically searches the web for queries requiring current information.
+![Python](https://img.shields.io/badge/Python-3.11-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.6.0%2Bcu124-EE4C2C)
+![llama.cpp](https://img.shields.io/badge/llama.cpp-Qwen3.5--4B-green)
+![CosyVoice2](https://img.shields.io/badge/TTS-CosyVoice2-purple)
+![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
-## Features
-- **Voice Interaction**: Uses STT for voice input and TTS for spoken responses.
-- **Smart Web Search**: Automatically performs web searches for queries needing up-to-date information using DuckDuckGo.
-- **Interrupt Handling**: Press the `Esc` key to interrupt responses.
-- **Streaming Responses**: Real-time text and speech output for a conversational experience.
-- **Modular Design**: Separate initialization for TTS, STT, and LLM components for robust error handling.
+IRIS is a low-latency, resource-disciplined, local-first AI assistant designed for hardware-constrained environments (specifically, a single 6 GB VRAM GPU). It combines **llama.cpp** for inference, **CosyVoice2** for zero-shot voice cloning, and a **dual-tier SQLite memory system** to provide conversational continuity and self-corrective RAG (CRAG).
 
-## Prerequisites
-To run this project, ensure you have the following:
-- **Python**: Version 3.8 or higher.
-- **Conda**: For managing the virtual environment.
-- **Hardware**: A microphone for STT and speakers/headphones for TTS.
-- **Internet Connection**: Required for web searches and model downloads.
+This document details the architecture, the strict single-GPU resource topology, the incremental streaming pipeline, and the memory topology.
 
-## Setup Instructions
+---
 
-### 1. Clone the Repository
-Clone the project repository to your local machine:
-```bash
-git [clone https://github.com/hacktivist211/tts-llm-agent.git](https://github.com/hacktivist211/tts_loop_agent.git)
-cd tts_loop_agent
-```
+## 1. System Architecture
 
+IRIS is built on the **"Single Inference Runtime"** principle. To prevent out-of-memory (OOM) crashes on a 6 GB RTX 4050, only one LLM instance is ever loaded into VRAM. The voice agent, the CRAG research pipeline, and the memory embedding engine all act as lightweight HTTP clients to the same `llama-server`.
 
-### 2. Create and Activate a Conda Environment
-Create a Conda environment to manage dependencies:
-```bash
-conda create -n tts-llm-agent python=3.8
-conda activate tts-llm-agent
-```
+### 1.1 High-Level Topology
 
-### 3. Install Dependencies
-Install the required Python packages using `pip`:
-```bash
-pip install numpy soundfile sounddevice requests beautifulsoup4 tqdm keyboard langchain-ollama
-```
+```mermaid
+graph TD
+    subgraph "GPU (6GB VRAM Limit)"
+        LLM[llama.cpp Server<br/>Qwen3.5-4B Q8_0<br/>--jinja --embeddings --pooling mean]
+        TTS[CosyVoice2 TTS<br/>FP16 Lazy-Loaded]
+    end
 
-#### Additional Dependencies
-- **Kokoro TTS**: Install the `kokoro` package for TTS functionality:
-  ```bash
-  pip install kokoro
-  ```
-  The `hexgrad/Kokoro-82M` model will be downloaded automatically during initialization.
+    subgraph "External"
+        Tavily[Tavily Web Search API]
+    end
 
-- **RealtimeSTT**: Install the `RealtimeSTT` package for STT functionality:
-  ```bash
-  pip install RealtimeSTT
-  ```
+    subgraph "Primary Runtime (Voice)"
+        Jarvis[jarvis.py / iris_boot.py]
+        ToolRuntime[tool_runtime.py<br/>Incremental SSE Client]
+        VoiceCache[voice_cache.py<br/>Frontend Memoization]
+    end
 
-- **Ollama LLM**: The LLM uses `langchain-ollama` with the `goekdenizguelmez/JOSIEFIED-Qwen3:8b` model. Install Ollama and pull the model:
-  1. Install Ollama from [Ollama's official site](https://ollama.ai/).
-  2. Pull the model:
-     ```bash
-     ollama pull goekdenizguelmez/JOSIEFIED-Qwen3:8b
-     ```
+    subgraph "CRAG Stack (Research)"
+        Main[main.py]
+        Router[evaluator_router.py<br/>Adaptive Routing & Grading]
+        Generator[generator.py<br/>Prompt Assembly]
+    end
 
-### 4. Verify Installation
-Ensure all dependencies are installed correctly:
-```bash
-python -c "import numpy, soundfile, sounddevice, requests, bs4, tqdm, keyboard, langchain_ollama, kokoro, RealtimeSTT"
-```
-If no errors appear, the environment is set up correctly.
+    subgraph "Storage (Flat Files)"
+        MemStore[(memory.db<br/>Personal Facts & Dense Vectors)]
+        TempStore[(temporal_memory.db<br/>Episodic Q&A Logs)]
+        VectorStore[(crag_vector_store<br/>ChromaDB Documents)]
+    end
 
-## Project Execution
-
-### Running the Agent
-1. Activate the Conda environment:
-   ```bash
-   conda activate tts-llm-agent
-   ```
-
-2. Run the main script:
-   ```bash
-   python tts_llm_agent.py
-   ```
-
-3. The agent will initialize the TTS, STT, and LLM modules, displaying a progress bar for TTS loading. Upon completion, it will announce:
-   ```
-   All systems online! I have smart internet access and will search automatically when your questions need current information. Press esc to interrupt me anytime.
-   ```
-
-### Interacting with the Agent
-- **Voice Input**: Speak into your microphone. Say "exit" to quit.
-- **Text Input**: If STT is unavailable (e.g., no microphone), type commands when prompted.
-- **Interrupt Responses**: Press the `Esc` key to stop the agent’s response.
-- **Disable Web Search**: Prefix queries with "no search:" to skip web searches (e.g., "no search: tell me a joke").
-
-### Example Commands
-- **General Query**: "What's the weather like today?"
-  - Triggers a web search and provides spoken/text response.
-- **Simple Query**: "Hello"
-  - Responds without searching.
-- **Math Query**: "What is 5 + 3?"
-  - Answers directly.
-- **No Search Query**: "no search: What's your name?"
-  - Bypasses web search.
-
-## Troubleshooting
-- **TTS/STT/LLM Initialization Errors**:
-  - Verify all dependencies are installed.
-  - Ensure internet connectivity for model downloads.
-  - Confirm Ollama is running (`ollama serve`) before starting the script.
-- **No Audio Output**:
-  - Check that speakers/headphones are connected and not muted.
-  - Verify `sounddevice` is configured for your audio device.
-- **No Voice Input**:
-  - Ensure your microphone is connected and functional.
-  - If STT fails, the agent will prompt for text input.
-- **Web Search Errors**:
-  - Confirm internet connectivity.
-  - Ensure DuckDuckGo’s HTML search endpoint is accessible.
-
-## Notes
-- The default TTS voice is `bm_lewis`. If unavailable, the script tries alternative voices or a default setting.
-- Audio sample rate is 24,000 Hz.
-- Threading ensures asynchronous TTS processing for smooth interaction.
-- Web searches are triggered for queries needing current information (e.g., news, weather) or complex questions.
-
-## License
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
-
-`tts_llm_agent.py` file using:
-  ```bash
-  git init
-  git add tts_llm_agent.py
-  git commit -m "Initial commit"
-  git remote add origin https://github.com/hacktivist211/tts-llm-agent.git
-  git push -u origin main
-  ```
+    %% Connections
+    Jarvis <--> ToolRuntime
+    Jarvis <--> VoiceCache
+    VoiceCache --> TTS
+    
+    Main <--> Router
+    Main <--> Generator
+    
+    ToolRuntime <-->|SSE /v1/chat/completions| LLM
+    ToolRuntime <-->|/v1/embeddings| LLM
+    ToolRuntime <-->|HTTP| Tavily
+    
+    Router <-->|HTTP Temp 0| LLM
+    Generator <-->|HTTP SSE| LLM
+    
+    ToolRuntime <--> MemStore
+    Main <--> TempStore
+    Main <--> VectorStore
