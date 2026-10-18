@@ -6,6 +6,7 @@
 ![CosyVoice2](https://img.shields.io/badge/TTS-CosyVoice2-purple)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
+
 Project codename: IRIS — a local-first, self-corrective voice assistant and memory system engineered to run within severe GPU constraints (single 6 GB VRAM GPU). This document explains design, architecture, pipelines, runtime topology, trade-offs, and rationale. It is intentionally detailed — this is the 7-day design sweat and paper-inspired engineering notes distilled into one working README.
 
 Table of contents
