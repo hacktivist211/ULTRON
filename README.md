@@ -6,7 +6,6 @@
 ![CosyVoice2](https://img.shields.io/badge/TTS-CosyVoice2-purple)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
-
 Project codename: IRIS — a local-first, self-corrective voice assistant and memory system engineered to run within severe GPU constraints (single 6 GB VRAM GPU). This document explains design, architecture, pipelines, runtime topology, trade-offs, and rationale. It is intentionally detailed — this is the 7-day design sweat and paper-inspired engineering notes distilled into one working README.
 
 Table of contents
@@ -62,31 +61,31 @@ Mermaid visualization of major runtime groups and flows:
 ```mermaid
 flowchart TD
   subgraph GPU["GPU (6GB VRAM Constraint)"]
-    LLM[llama.cpp Server<br/>Quantized model (e.g. Qwen3.5-4B Q8_0)]
-    TTS[CosyVoice2 TTS<br/>FP16 Lazy-Loaded]
+    LLM["llama.cpp Server<br/>Quantized model, e.g. Qwen3.5-4B Q8_0"]
+    TTS["CosyVoice2 TTS<br/>FP16 Lazy-Loaded"]
   end
 
   subgraph Runtime["Primary Runtime (voice agent)"]
-    Jarvis[jarvis.py / iris_boot.py<br/>Main event loop]
-    ToolRuntime[tool_runtime.py<br/>SSE HTTP client / inference orchestrator]
-    VoiceCache[voice_cache.py<br/>frontend memoization & stream manager]
+    Jarvis["jarvis.py / iris_boot.py<br/>Main event loop"]
+    ToolRuntime["tool_runtime.py<br/>SSE HTTP client / inference orchestrator"]
+    VoiceCache["voice_cache.py<br/>frontend memoization & stream manager"]
   end
 
   subgraph CRAG["CRAG: self-corrective RAG (research stack)"]
-    Main[main.py<br/>evaluation orchestrator]
-    Router[evaluator_router.py<br/>adaptive grader]
-    Generator[prompt_generator.py<br/>prompt assembly]
+    Main["main.py<br/>evaluation orchestrator"]
+    Router["evaluator_router.py<br/>adaptive grader"]
+    Generator["prompt_generator.py<br/>prompt assembly"]
   end
 
   subgraph Storage["Persistent Storage"]
-    MemDB[(memory.db<br/>facts + dense vectors)]
-    TempDB[(temporal_memory.db<br/>episodic logs)]
-    VectorStore[(crag_vector_store/<br/>chroma-compatible docs)]
+    MemDB[("memory.db<br/>facts + dense vectors")]
+    TempDB[("temporal_memory.db<br/>episodic logs")]
+    VectorStore[("crag_vector_store/<br/>chroma-compatible docs")]
   end
 
-  Runtime -->|SSE /v1/chat/completions| LLM
-  Runtime -->|/v1/embeddings| LLM
-  CRAG -->|HTTP SSE / prompts| LLM
+  Runtime -->|"SSE /v1/chat/completions"| LLM
+  Runtime -->|"/v1/embeddings"| LLM
+  CRAG -->|"HTTP SSE / prompts"| LLM
   VoiceCache --> TTS
   ToolRuntime --> MemDB
   Main --> TempDB
@@ -454,13 +453,13 @@ sequenceDiagram
   participant R as Runtime
   participant M as Memory
   participant L as LLM (llama-server)
-  participant G as GRader (CRAG)
+  participant G as Grader (CRAG)
   participant T as TTS (CosyVoice2)
 
   U->>R: audio / text
   R->>M: retrieve(top-k)
   M-->>R: facts + embeddings
-  R->>L: SSE /v1/chat.completions (prompt + retrievals)
+  R->>L: SSE /v1/chat/completions (prompt + retrievals)
   L-->>R: streaming tokens
   R->>G: send final completion for grading
   G-->>R: confidence + patch
@@ -477,9 +476,8 @@ Memory lifecycle:
 ```mermaid
 flowchart LR
   UserInput -->|embed| EmbeddingService
-  EmbeddingService --> VectorStore[(memory.db vectors)]
-  UserInput --> LogStore[(temporal_memory.db)]
+  EmbeddingService --> VectorStore[("memory.db vectors")]
+  UserInput --> LogStore[("temporal_memory.db")]
   VectorStore --> RetrievalEngine
   RetrievalEngine --> PromptGenerator
 ```
-
