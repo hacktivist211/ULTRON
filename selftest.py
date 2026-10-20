@@ -19,6 +19,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -33,6 +35,26 @@ def check(name: str, cond: bool, detail: str = ""):
     RESULTS.append((name, bool(cond), detail))
     mark = "PASS" if cond else "FAIL"
     print(f"  [{mark}] {name}" + (f"  ({detail})" if detail and not cond else ""))
+
+
+def _ensure_sounddevice_stub() -> bool:
+    """Inject a no-op sounddevice module when the real one is unavailable.
+
+    ultron.py exits at import time without it. Returns True when a stub was
+    installed so the caller can remove it again.
+    """
+    import types
+
+    try:
+        import sounddevice  # noqa: F401
+        return False
+    except ImportError:
+        fake_sd = types.ModuleType("sounddevice")
+        fake_sd.OutputStream = object
+        fake_sd.rec = lambda *a, **k: None
+        fake_sd.wait = lambda: None
+        sys.modules["sounddevice"] = fake_sd
+        return True
 
 
 # ------------------------------------------------------------------ config tests
@@ -364,6 +386,35 @@ def test_streaming_core():
               for m in post.payloads[1]["messages"] if m["role"] == "tool"))
     check("conversation recovers after malformed args", text3 == "recovered")
 
+    # 4b. allowed_tools: an unoffered tool is never executed
+    blocked_stream = _sse(
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c_block",
+                        "function": {"name": "web_search", "arguments": "{\"query\":\"x\"}"}}]}}]},
+    )
+    post_b = _FakePost([
+        _FakeStreamResponse([blocked_stream]),
+        _FakeStreamResponse([_sse({"choices": [{"delta": {"content": "answered without it"}}]})]),
+    ])
+    executed_b = []
+    orig_b = tr.execute_tool
+    tr.execute_tool = lambda n, a: executed_b.append(n) or {"ok": True, "_tool": n, "_ms": 0}
+    try:
+        text_b, trace_b = tr.chat(
+            [{"role": "user", "content": "q"}],
+            allowed_tools=["memory_search"], _post=post_b)
+    finally:
+        tr.execute_tool = orig_b
+    offered_b = {t["function"]["name"] for t in post_b.payloads[0].get("tools", [])}
+    check("only allowed tool schemas are offered", offered_b == {"memory_search"},
+          f"offered={offered_b}")
+    check("unoffered tool never executes", executed_b == [] and trace_b == [],
+          f"executed={executed_b} trace={trace_b}")
+    check("blocked tool gets a not-available message",
+          any("tool not available this turn" in str(m.get("content", ""))
+              for m in post_b.payloads[1]["messages"] if m["role"] == "tool"))
+    check("conversation completes after a blocked tool",
+          text_b == "answered without it", f"text={text_b!r}")
+
     # 5. history trimming
     msgs = [{"role": "system", "content": "sys"}] + [
         {"role": "user", "content": f"q{i} " + "x" * 100} for i in range(30)
@@ -453,8 +504,9 @@ def test_ultron_auto_memory():
     captured = {}
 
     def fake_chat(messages=None, on_delta=None, on_tool_start=None,
-                  use_tools=True, **kwargs):
+                  use_tools=True, allowed_tools=None, **kwargs):
         captured["messages"] = messages
+        captured["allowed_tools"] = allowed_tools
         if on_delta:
             on_delta("noted")
         return "noted", []
@@ -475,8 +527,14 @@ def test_ultron_auto_memory():
 
         # Keep the test fully offline: no embedding HTTP call in the worker.
         engine.memory._embed_batch = lambda texts: None
+        engine._keys = None  # no terminal manipulation in the offline suite
         engine.temporal.forget("all")
         engine.run_turn("I live in Kyoto and I prefer dark mode")
+
+        check("standard turn offers all tools",
+              captured.get("allowed_tools")
+              == ["web_search", "memory_search", "memory_add"],
+              f"got={captured.get('allowed_tools')}")
 
         if engine._fact_thread is not None:
             engine._fact_thread.join(timeout=10)
@@ -512,6 +570,304 @@ def test_ultron_auto_memory():
         engine.temporal.forget("last")
         check("forget removes the most recent turn",
               engine.temporal.stats()["turns"] == 0)
+    finally:
+        try:
+            if engine is not None:
+                if engine.memory is not None:
+                    engine.memory.close()
+                if engine.temporal is not None:
+                    engine.temporal._conn.close()
+        except Exception:
+            pass
+        cfg.MEMORY_DB = orig_memory_db
+        memory_store._SHARED = orig_shared
+        ultron.AudioPlayer = orig_player
+        ultron.TemporalMemory = orig_temporal
+        stt_engine.get_stt = orig_get_stt
+        tts_engine.get_tts = orig_get_tts
+        tool_runtime.chat = orig_chat
+        if injected_sd:
+            sys.modules.pop("sounddevice", None)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ultron_tool_gating():
+    print("\n== ultron tool gating (offline, stub chat) ==")
+    import stt_engine
+    import tool_runtime
+    import tts_engine
+
+    injected_sd = _ensure_sounddevice_stub()
+    import ultron
+
+    orig_player = ultron.AudioPlayer
+    orig_temporal = ultron.TemporalMemory
+    orig_get_store = ultron.get_store
+    orig_get_stt = stt_engine.get_stt
+    orig_get_tts = tts_engine.get_tts
+    orig_chat = tool_runtime.chat
+    engine = None
+    seen: list[dict] = []
+
+    class _FakePlayer:
+        def __init__(self, *a, **k):
+            pass
+
+        def play(self, *a, **k):
+            pass
+
+        def wait_idle(self, timeout=None):
+            pass
+
+        def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_chat(messages=None, on_delta=None, on_tool_start=None,
+                  use_tools=True, allowed_tools=None, **kwargs):
+        seen.append({
+            "use_tools": use_tools,
+            "allowed_tools": list(allowed_tools) if allowed_tools is not None else None,
+            "trace": [],
+        })
+        if on_delta:
+            on_delta("noted")
+        return "noted", []
+
+    try:
+        ultron.AudioPlayer = _FakePlayer
+        ultron.TemporalMemory = lambda: None
+        ultron.get_store = lambda: None
+        stt_engine.get_stt = lambda: None
+        tts_engine.get_tts = lambda: None
+        tool_runtime.chat = fake_chat
+
+        engine = ultron.UltronEngine()
+        engine._keys = None  # keep the offline suite away from the terminal
+        engine._speak = lambda text: None
+
+        cases = [
+            ("Hi everyone.", []),
+            ("How are you doing?", []),
+            ("Do you remember what I said about my GPU?",
+             ["memory_search", "memory_add"]),
+            ("What's the latest Python version?",
+             ["web_search", "memory_search", "memory_add"]),
+        ]
+        for text, expected in cases:
+            engine.run_turn(text)
+            got = seen[-1]
+            label = ",".join(expected) or "none"
+            check(f"gate {text!r} -> {label}",
+                  got["allowed_tools"] == expected, f"got={got['allowed_tools']}")
+            check(f"gate {text!r} use_tools matches",
+                  got["use_tools"] == bool(expected), f"got={got['use_tools']}")
+            if not expected:
+                check(f"gate {text!r} produces no tool trace",
+                      got["trace"] == [], f"trace={got['trace']}")
+    finally:
+        ultron.AudioPlayer = orig_player
+        ultron.TemporalMemory = orig_temporal
+        ultron.get_store = orig_get_store
+        stt_engine.get_stt = orig_get_stt
+        tts_engine.get_tts = orig_get_tts
+        tool_runtime.chat = orig_chat
+        if engine is not None:
+            try:
+                engine.player.close()
+            except Exception:
+                pass
+        if injected_sd:
+            sys.modules.pop("sounddevice", None)
+
+
+def test_ultron_recording_stop():
+    print("\n== ultron recording: Enter stop, safety net, silence ==")
+    import numpy as np
+
+    injected_sd = _ensure_sounddevice_stub()
+    import ultron
+
+    orig_rec = ultron.sd.rec
+    orig_wait = ultron.sd.wait
+    orig_stdin = sys.stdin
+
+    class _FakeSTT:
+        def transcribe_array(self, audio, sr):
+            return {"text": "hello"}
+
+    class _DelayedStdin:
+        def fileno(self):
+            raise OSError("not a tty")
+
+        def readline(self):
+            time.sleep(0.15)
+            return "stop\n"
+
+    class _BlockingStdin:
+        def fileno(self):
+            raise OSError("not a tty")
+
+        def readline(self):
+            time.sleep(30)
+            return ""
+
+    class _ImmediateStdin:
+        def fileno(self):
+            raise OSError("not a tty")
+
+        def readline(self):
+            return "\n"
+
+    engine = object.__new__(ultron.UltronEngine)
+    engine.mic_rate = 16000
+    engine.stt = _FakeSTT()
+    engine._stop_recording_event = threading.Event()
+
+    calls = {"n": 0}
+
+    def speech_rec(block, samplerate, channels, dtype, blocking):
+        calls["n"] += 1
+        time.sleep(0.1)
+        return np.full((block, 1), 0.2, dtype=np.float32)
+
+    def fast_speech_rec(block, samplerate, channels, dtype, blocking):
+        calls["n"] += 1
+        return np.full((block, 1), 0.2, dtype=np.float32)
+
+    def silent_rec(block, samplerate, channels, dtype, blocking):
+        calls["n"] += 1
+        return np.zeros((block, 1), dtype=np.float32)
+
+    try:
+        ultron.sd.wait = lambda: None
+
+        # Enter after ~2 blocks of a 5-block recording window.
+        calls["n"] = 0
+        sys.stdin = _DelayedStdin()
+        ultron.sd.rec = speech_rec
+        text = engine._record_and_transcribe(max_s=0.5)
+        check("Enter stops before the safety net", calls["n"] < 5,
+              f"blocks={calls['n']}")
+        check("Enter path transcribes captured audio", text == "hello",
+              f"text={text!r}")
+
+        # No Enter: the 60 s safety net must stop the loop.
+        calls["n"] = 0
+        sys.stdin = _BlockingStdin()
+        ultron.sd.rec = fast_speech_rec
+        expected_blocks = max(1, int(60.0 / 0.1))
+        text2 = engine._record_and_transcribe(max_s=60.0)
+        check("safety net stops at max_s", calls["n"] == expected_blocks,
+              f"blocks={calls['n']} expected={expected_blocks}")
+        check("safety-net path transcribes", text2 == "hello", f"text={text2!r}")
+
+        # Silence only: Enter must still yield an empty transcript.
+        calls["n"] = 0
+        sys.stdin = _ImmediateStdin()
+        ultron.sd.rec = silent_rec
+        text3 = engine._record_and_transcribe(max_s=2.0)
+        check("silent audio returns empty string", text3 == "", f"text={text3!r}")
+    finally:
+        ultron.sd.rec = orig_rec
+        ultron.sd.wait = orig_wait
+        sys.stdin = orig_stdin
+        if injected_sd:
+            sys.modules.pop("sounddevice", None)
+
+
+def test_ultron_esc_cancel():
+    print("\n== ultron Esc cancellation (offline, stub chat) ==")
+    import shutil
+
+    import memory_store
+    import stt_engine
+    import tool_runtime
+    import tts_engine
+
+    injected_sd = _ensure_sounddevice_stub()
+    import ultron
+
+    tmp = Path(tempfile.mkdtemp(prefix="iris_st_ultron_cancel_"))
+    orig_memory_db = cfg.MEMORY_DB
+    orig_shared = memory_store._SHARED
+    orig_player = ultron.AudioPlayer
+    orig_temporal = ultron.TemporalMemory
+    orig_get_stt = stt_engine.get_stt
+    orig_get_tts = tts_engine.get_tts
+    orig_chat = tool_runtime.chat
+    engine = None
+
+    class _FakePlayer:
+        def __init__(self, *a, **k):
+            self.drained = 0
+
+        def play(self, *a, **k):
+            pass
+
+        def wait_idle(self, timeout=None):
+            pass
+
+        def drain(self):
+            self.drained += 1
+
+        def close(self):
+            pass
+
+    def fake_chat(messages=None, on_delta=None, on_tool_start=None,
+                  use_tools=True, allowed_tools=None, **kwargs):
+        for i in range(3):
+            on_delta(f"token{i} ")
+            if i == 1:
+                engine._keys.interrupted.set()
+        return "token0 token1 token2", []
+
+    try:
+        memory_store._SHARED = None
+        cfg.MEMORY_DB = tmp / "memory.db"
+        ultron.AudioPlayer = _FakePlayer
+        ultron.TemporalMemory = lambda: orig_temporal(
+            db_path=str(tmp / "temporal_memory.db"), visual=False)
+        stt_engine.get_stt = lambda: None
+        tts_engine.get_tts = lambda: None
+        tool_runtime.chat = fake_chat
+
+        engine = ultron.UltronEngine()
+        engine.memory._embed_batch = lambda texts: None
+        engine.temporal.forget("all")
+        spoken: list[str] = []
+        engine._speak = spoken.append
+        before_turns = engine.temporal._session_turns
+
+        engine.run_turn("some query")
+
+        rows = engine.temporal._conn.execute(
+            "SELECT COUNT(*) FROM turns").fetchone()[0]
+        memories = engine.memory.db.execute(
+            "SELECT COUNT(*) FROM memories").fetchone()[0]
+
+        check("cancelled turn leaves history untouched", engine.history == [],
+              f"history={engine.history}")
+        check("cancelled turn is not saved to temporal memory", rows == 0,
+              f"rows={rows}")
+        check("cancelled turn is not saved to durable memory", memories == 0,
+              f"memories={memories}")
+        check("cancelled turn speaks the re-listen acknowledgment",
+              any("Listening again." in text for text in spoken),
+              f"spoken={spoken}")
+        check("cancelled turn drains the audio queue",
+              engine.player.drained >= 1, f"drained={engine.player.drained}")
+        check("Esc event stays latched until the next turn",
+              engine._keys.interrupted.is_set())
+        check("cancelled turn does not count toward the session",
+              engine.temporal._session_turns == before_turns,
+              f"turns={engine.temporal._session_turns} before={before_turns}")
+
+        engine._keys.reset()
+        check("Esc event resets for the next turn",
+              not engine._keys.interrupted.is_set())
     finally:
         try:
             if engine is not None:
@@ -570,6 +926,12 @@ def test_tool_runtime_offline():
           and "no guard rails" in sys_prompt.lower()
           and 'address the user directly' in sys_prompt.lower())
     check("system prompt has word budgets", "60" in sys_prompt)
+    check("strict web_search policy in prompt",
+          "call this ONLY for news" in sys_prompt
+          and "NEVER call it for greetings" in sys_prompt)
+    check("strict memory_search policy in prompt",
+          "own past statements" in sys_prompt
+          and "generic philosophy questions" in sys_prompt)
     check("schemas registered", {t["function"]["name"] for t in tool_runtime.tool_schemas()} >= {"web_search", "memory_search", "memory_add"})
 
     unknown = tool_runtime.execute_tool("nonexistent_tool", {})
@@ -804,6 +1166,337 @@ def test_download_models():
           f"rc={r.returncode} {r.stderr[:160]}")
 
 
+def test_memory_proxy():
+    print("\n== memory_proxy (offline, stub upstream) ==")
+    import shutil
+
+    import requests
+
+    import memory_proxy
+    import memory_store
+    import temporal_memory
+    import tool_runtime
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="iris_st_proxy_"))
+    stores = []
+    temporals = []
+    handles = []
+    orig_store = memory_proxy._STORE
+    orig_temporal = memory_proxy._TEMPORAL
+    orig_persist = memory_proxy.PERSISTENCE_ENABLED
+    orig_chat = tool_runtime.chat
+    handle = None
+    captured: dict = {}
+
+    def fresh_state(tag):
+        memory_proxy.wait_for_facts(5.0)
+        memory_proxy.reset_state()
+        store = memory_store.MemoryStore(
+            db_path=str(tmpdir / f"{tag}_memory.db"), embed=False)
+        temporal = temporal_memory.TemporalMemory(
+            db_path=str(tmpdir / f"{tag}_temporal.db"), visual=False)
+        memory_proxy._STORE = store
+        memory_proxy._TEMPORAL = temporal
+        stores.append(store)
+        temporals.append(temporal)
+        return store, temporal
+
+    def post(path, payload, stream=False):
+        return requests.post(handle.base_url + path, json=payload,
+                             timeout=15, stream=stream)
+
+    def sse_body(response):
+        return b"".join(response.iter_content(chunk_size=None)).decode("utf-8")
+
+    def parse_sse(body):
+        events = []
+        for line in body.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                events.append("[DONE]")
+                continue
+            try:
+                events.append(json.loads(data))
+            except json.JSONDecodeError:
+                pass
+        return events
+
+    def hello_chat(messages=None, on_delta=None, use_tools=True,
+                   allowed_tools=None, _post=None, **kwargs):
+        captured["messages"] = messages
+        captured["use_tools"] = use_tools
+        captured["allowed_tools"] = allowed_tools
+        for piece in ("hello ", "from ", "proxy"):
+            if on_delta:
+                on_delta(piece)
+        return "hello from proxy", []
+
+    try:
+        memory_proxy.PERSISTENCE_ENABLED = True
+
+        import socket
+
+        probe = memory_proxy.start_in_background(
+            host="127.0.0.1", port=0, upstream="http://127.0.0.1:9")
+        started = probe.port > 0 and probe.thread.is_alive()
+        probe.shutdown()
+        released = False
+        try:
+            sock = socket.socket()
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", probe.port))
+            sock.close()
+            released = True
+        except OSError:
+            released = False
+        check("proxy server starts and stops cleanly",
+              started and not probe.thread.is_alive() and released,
+              f"port={probe.port} alive={probe.thread.is_alive()} "
+              f"released={released}")
+
+        handle = memory_proxy.start_in_background(
+            host="127.0.0.1", port=0, upstream="http://127.0.0.1:9")
+        handles.append(handle)
+        tool_runtime.chat = hello_chat
+
+        health = requests.get(handle.base_url + "/health", timeout=5)
+        health_json = health.json() if health.status_code == 200 else {}
+        check("GET /health returns expected JSON",
+              health.status_code == 200
+              and health_json.get("proxy") == "ultron-memory"
+              and health_json.get("ok") is True,
+              f"HTTP {health.status_code} {health.text[:160]}")
+
+        models = requests.get(handle.base_url + "/v1/models", timeout=5)
+        model_list = models.json().get("data", []) if models.status_code == 200 else []
+        check("GET /v1/models returns one model entry",
+              models.status_code == 200 and len(model_list) == 1
+              and model_list[0].get("id") == cfg.LLM_MODEL_NAME,
+              f"HTTP {models.status_code} {models.text[:160]}")
+
+        fresh_state("stream")
+        stream_resp = post(
+            "/v1/chat/completions",
+            {"model": "ignored", "stream": True,
+             "messages": [{"role": "user", "content": "hello there"}]},
+            stream=True,
+        )
+        stream_body = sse_body(stream_resp)
+        events = parse_sse(stream_body)
+        deltas = []
+        stop_chunks = 0
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            for choice in event.get("choices", []):
+                if choice.get("finish_reason") == "stop":
+                    stop_chunks += 1
+                piece = (choice.get("delta") or {}).get("content")
+                if piece:
+                    deltas.append(piece)
+        check("POST stream=true returns OpenAI SSE in order",
+              stream_resp.headers.get("Content-Type", "").startswith("text/event-stream")
+              and deltas == ["hello ", "from ", "proxy"]
+              and stream_body.rstrip().endswith("data: [DONE]")
+              and stop_chunks == 1,
+              f"ct={stream_resp.headers.get('Content-Type')!r} "
+              f"deltas={deltas!r} stops={stop_chunks} tail={stream_body[-100:]!r}")
+
+        store, _temporal = fresh_state("inject")
+        store.add("My name is Neeraj", speaker="user", source="manual",
+                  kind="fact", importance=0.9)
+        captured.clear()
+        injected_resp = post(
+            "/v1/chat/completions",
+            {"model": "ignored", "stream": True,
+             "messages": [{"role": "user", "content": "What is my name?"}]},
+            stream=True,
+        )
+        sse_body(injected_resp)
+        injected_messages = captured.get("messages") or []
+        first = injected_messages[0] if injected_messages else {}
+        check("durable memory injected into prepended system prompt",
+              first.get("role") == "system"
+              and "Neeraj" in str(first.get("content", "")),
+              f"first={str(first.get('content', ''))[:180]!r}")
+
+        _store, temporal = fresh_state("turn")
+        user_message = "what is the capital of France"
+        turn_resp = post(
+            "/v1/chat/completions",
+            {"model": "ignored", "stream": True,
+             "messages": [{"role": "user", "content": user_message}]},
+            stream=True,
+        )
+        sse_body(turn_resp)
+        rows = temporal._conn.execute(
+            "SELECT query, verdict FROM turns").fetchall()
+        check("UI turn saved with verdict=UI",
+              temporal.stats()["turns"] == 1 and len(rows) == 1
+              and rows[0]["query"] == user_message
+              and rows[0]["verdict"] == "UI",
+              f"turns={temporal.stats()['turns']} "
+              f"rows={[dict(r) for r in rows]}")
+
+        store, _temporal = fresh_state("fact")
+        fact_resp = post(
+            "/v1/chat/completions",
+            {"model": "ignored", "stream": True,
+             "messages": [{"role": "user", "content": "My GPU is an RTX 4050"}]},
+            stream=True,
+        )
+        sse_body(fact_resp)
+        memory_proxy.wait_for_facts(5.0)
+        fact_rows = store.db.execute(
+            "SELECT content, source FROM memories WHERE source = 'ui_auto'"
+        ).fetchall()
+        check("personal fact auto-captured with source=ui_auto",
+              any("RTX 4050" in content for content, _source in fact_rows),
+              f"rows={[(c[:40], s) for c, s in fact_rows]}")
+
+        store, _temporal = fresh_state("shared")
+        store.add("My wifi password is hunter2", speaker="user",
+                  source="manual", kind="fact", importance=0.8)
+        captured.clear()
+        read_resp = post(
+            "/v1/chat/completions",
+            {"model": "ignored", "stream": True,
+             "messages": [{"role": "user", "content": "what is my wifi password?"}]},
+            stream=True,
+        )
+        sse_body(read_resp)
+        direct_seen = any(
+            "hunter2" in str((m or {}).get("content", ""))
+            for m in (captured.get("messages") or [])[:1]
+        )
+        write_resp = post(
+            "/v1/chat/completions",
+            {"model": "ignored", "stream": True,
+             "messages": [{"role": "user", "content":
+                           "My favorite editor is Neovim"}]},
+            stream=True,
+        )
+        sse_body(write_resp)
+        memory_proxy.wait_for_facts(5.0)
+        found = store.search("Neovim")
+        check("shared memory works in both directions",
+              direct_seen and any("Neovim" in hit.content for hit in found),
+              f"direct_seen={direct_seen} hits={[h.content[:50] for h in found]}")
+
+        missing = post("/v1/chat/completions", {})
+        missing_json = missing.json() if missing.headers.get(
+            "Content-Type", "").startswith("application/json") else {}
+        check("missing messages returns 400 with error body",
+              missing.status_code == 400 and "error" in missing_json,
+              f"HTTP {missing.status_code} {missing.text[:160]}")
+
+        fresh_state("failure")
+
+        def failing_chat(messages=None, on_delta=None, **kwargs):
+            raise tool_runtime.LlamaServerError("boom")
+
+        tool_runtime.chat = failing_chat
+        failed = post(
+            "/v1/chat/completions",
+            {"model": "ignored", "stream": True,
+             "messages": [{"role": "user", "content": "will fail"}]},
+            stream=True,
+        )
+        check("upstream failure returns 502",
+              failed.status_code == 502
+              and "upstream unreachable" in failed.text,
+              f"HTTP {failed.status_code} {failed.text[:160]}")
+        tool_runtime.chat = hello_chat
+
+        fresh_state("buffered")
+        buffered = post(
+            "/v1/chat/completions",
+            {"model": "ignored", "stream": False,
+             "messages": [{"role": "user", "content": "hello there"}]},
+        )
+        buffered_json = buffered.json() if buffered.status_code == 200 else {}
+        try:
+            buffered_choice = buffered_json["choices"][0]
+            buffered_content = buffered_choice["message"]["content"]
+            buffered_finish = buffered_choice["finish_reason"]
+        except (KeyError, IndexError, TypeError):
+            buffered_content, buffered_finish = None, None
+        check("stream=false returns one buffered completion object",
+              buffered.status_code == 200
+              and buffered_json.get("object") == "chat.completion"
+              and buffered_content == "hello from proxy"
+              and buffered_finish == "stop",
+              f"HTTP {buffered.status_code} {buffered.text[:200]}")
+
+        _store, temporal = fresh_state("concurrent")
+
+        def slow_chat(messages=None, on_delta=None, **kwargs):
+            time.sleep(0.1)
+            if on_delta:
+                on_delta("ok")
+            return "ok", []
+
+        tool_runtime.chat = slow_chat
+        statuses = []
+
+        def fire(text):
+            response = post(
+                "/v1/chat/completions",
+                {"model": "ignored", "stream": True,
+                 "messages": [{"role": "user", "content": text}]},
+                stream=True,
+            )
+            sse_body(response)
+            statuses.append(response.status_code)
+
+        workers = [
+            threading.Thread(target=fire, args=(text,), daemon=True)
+            for text in ("first concurrent request", "second concurrent request")
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=15)
+        concurrent_rows = temporal._conn.execute(
+            "SELECT turn_no FROM turns ORDER BY turn_no").fetchall()
+        turn_nos = [row["turn_no"] for row in concurrent_rows]
+        check("concurrent requests keep distinct turn numbers",
+              statuses == [200, 200]
+              and temporal.stats()["turns"] == 2
+              and len(turn_nos) == 2 and len(set(turn_nos)) == 2,
+              f"statuses={statuses} turns={temporal.stats()['turns']} "
+              f"turn_nos={turn_nos}")
+    finally:
+        tool_runtime.chat = orig_chat
+        memory_proxy.PERSISTENCE_ENABLED = orig_persist
+        try:
+            memory_proxy.wait_for_facts(5.0)
+        except Exception:
+            pass
+        for item in handles:
+            try:
+                item.shutdown()
+            except Exception:
+                pass
+        for store in stores:
+            try:
+                store.close()
+            except Exception:
+                pass
+        for temporal in temporals:
+            try:
+                temporal._conn.close()
+            except Exception:
+                pass
+        memory_proxy.reset_state()
+        memory_proxy._STORE = orig_store
+        memory_proxy._TEMPORAL = orig_temporal
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_docs_and_files():
     print("\n== deliverable files & docs ==")
     base = Path(cfg.IRIS_DIR)
@@ -842,6 +1535,9 @@ def main() -> int:
     test_memory_restart()
     test_memory_import()
     test_ultron_auto_memory()
+    test_ultron_tool_gating()
+    test_ultron_recording_stop()
+    test_ultron_esc_cancel()
     test_tavily_offline()
     test_tavily_edge()
     test_streaming_core()
@@ -850,6 +1546,7 @@ def main() -> int:
     test_voice_offline()
     test_tts_real()
     test_download_models()
+    test_memory_proxy()
     test_docs_and_files()
     if live:
         test_live()

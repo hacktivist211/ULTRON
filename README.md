@@ -358,6 +358,28 @@ score = 0.72·keyword_overlap + 0.28·0.5^(age_days / 14)
 
 **Session model** — `temporal_memory.begin_turn()` starts a new session after `CRAG_SESSION_IDLE_MINUTES=30` of inactivity, and the temporal injector block handed to the generator includes the current time, the humanized time since the last interaction, and the session’s turn count.
 
+### Shared memory via proxy (chat UIs)
+
+When you cannot speak, point any OpenAI-compatible chat UI (Open WebUI, LM Studio, …) at the proxy instead of llama-server. The proxy injects the same `memory.db` context ULTRON uses, streams from llama-server, then writes the turn to `temporal_memory.db` (`verdict="UI"`) and personal facts to `memory.db` (`source="ui_auto"`). ULTRON itself keeps talking to `:8080` directly and needs no changes.
+
+```bash
+python memory_proxy.py                 # 127.0.0.1:8081 -> 127.0.0.1:8080
+# optional:
+python memory_proxy.py --port 8081 --upstream http://127.0.0.1:8080
+```
+
+Paste this into the UI:
+
+```
+Endpoint URL:  http://127.0.0.1:8081/v1/chat/completions
+API base URL:  http://127.0.0.1:8081/v1
+Model name:    Qwen3.5-4B
+Streaming:     ON
+Tools / function calling: OFF
+```
+
+`GET /v1/models`, `GET /health`, and `GET /stats` are available for UIs that probe the server. Tool calls are deliberately not exposed: chat UIs cannot complete a tool round trip. Memory still arrives through the injected system prompt, so personal questions work without `memory_search`. Set `MEMORY_PROXY_ENABLED=0` for a read-only passthrough (no memory writes); override the listener with `MEMORY_PROXY_HOST`, `MEMORY_PROXY_PORT`, and `MEMORY_PROXY_UPSTREAM`.
+
 ---
 
 ## 7. CRAG pipeline (optional)
@@ -417,6 +439,7 @@ flowchart TD
 | `tavily_tool.py` | Tools | `web_search` implementation + `speakable()` digest |
 | `memory_store.py` | Memory | Durable personal memory + `memory_search` / `memory_add` tools |
 | `memory_import.py` | Memory | Importers for ChatGPT / Claude / Gemini / generic / plain text |
+| `memory_proxy.py` | Memory | OpenAI-compatible `:8081` proxy; shared memory for UI turns |
 | `main.py` | CRAG | Interactive CRAG CLI (uses `evaluator_router`, `generator`, `retrieval`) |
 | `evaluator_router.py` | CRAG | Grading, refinement, query rewriting, adaptive router, web fallback |
 | `generator.py` | CRAG | Grounded answer generation via `tool_runtime.stream_completion` |
@@ -425,7 +448,7 @@ flowchart TD
 | `iris_config.py` | Config | `.env` loader, scrubbers, memory map, history/retry policy, `.env` editor |
 | `start_llama.sh` | Infra | Launcher with pre-flight, health wait, clean Ctrl+C shutdown |
 | `monitor_gpu.sh` | Infra | CSV sampler of VRAM / RAM / per-process GPU memory |
-| `selftest.py` | Test | 104 offline checks (config, memory, import, tools, streaming, voice logic) |
+| `selftest.py` | Test | 154 offline checks (config, memory, import, tools, proxy, streaming, voice logic) |
 | `test_streaming.py` | Test | 49 checks proving genuine SSE incrementality, incl. real-socket test |
 | `test_integration.py` | Test | Live suite; each check is labeled PASS / FAIL / SKIP (with reason) |
 | `bench_first_token.py` | Bench | TTFT + chars/sec against llama-server |
@@ -583,7 +606,7 @@ All values come from `.env` or the process environment (via `iris_config.load_do
 
 | Suite | Requires | Expected |
 |---|---|---|
-| `python selftest.py` | nothing | **104 / 104 PASS** (offline) |
+| `python selftest.py` | nothing | **154 / 154 PASS** (offline) |
 | `python test_streaming.py` | nothing | **49 / 49 PASS** in <1 s (real-socket test binds a local port) |
 | `python test_integration.py` | `llama-server` (+ voice deps for section 9) | each section prints `PASS` / `FAIL` / `SKIP (reason)` |
 | `python download_models.py --check` | nothing | JSON status: `stt_snapshot_complete`, `deps_missing`, `env_keys` |

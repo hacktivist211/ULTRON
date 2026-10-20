@@ -176,6 +176,57 @@ latency (`TAVILY_TIMEOUT`, default 9 s budget). Streaming guarantees
 tool args never execute, response always closed) are unchanged and still
 proven by `test_streaming.py`.
 
+### Turn control (v1 limitations)
+
+- **Recording:** press **Enter** to stop manually. If you forget, a 60 s
+  safety net stops the recording. Silence auto-stop still exists, but only
+  after 400 ms of speech and 3 s of silence.
+- **Interrupting an answer:** press **Esc** while the reply is streaming.
+  ULTRON closes the LLM stream, drains queued TTS audio, discards the turn
+  (no history row, no `temporal_memory.db` row, no durable fact), says
+  "Listening again.", and returns to the recorder. Previously accepted turns
+  are untouched.
+- **Known v1 limitation:** Esc during TTS *playback after streaming has
+  finished* is ignored — the answer is already complete and cannot be
+  un-said. Esc during the final `player.wait_idle()` window does not
+  interrupt playback either; the call is bounded (120 s) and returns when the
+  queue drains. Interrupt support also requires an interactive stdin (a real
+  terminal); piping ULTRON's stdin logs one warning and runs without it.
+- **Tool gate:** each turn is classified as `simple` (no tools), `memory`
+  (`memory_search` + `memory_add`), or `standard` (all tools). The classifier
+  is the pure-regex `evaluator_router.classify_query`, so it adds no LLM
+  latency. The log line `[ultron] tools: <kind> -> ...` shows the decision.
+
+### Shared memory via proxy (chat UIs)
+
+When you cannot speak, chat UIs share ULTRON's memory through a small
+OpenAI-compatible proxy. Run it beside llama-server:
+
+```bash
+python memory_proxy.py     # listens on 127.0.0.1:8081, upstream :8080
+```
+
+Client config:
+
+```
+Endpoint URL:  http://127.0.0.1:8081/v1/chat/completions
+API base URL:  http://127.0.0.1:8081/v1
+Model name:    Qwen3.5-4B
+Streaming:     ON
+Tools / function calling: OFF
+```
+
+The proxy prepends `build_system(memory_query=...)` context, streams the
+llama-server reply unchanged, then writes the turn to
+`iris_memory/temporal_memory.db` with `verdict="UI"` and auto-captures
+personal facts to `memory.db` with `source="ui_auto"`. ULTRON keeps using
+`:8080` directly and writes `VOICE` / `voice_auto`, so provenance survives.
+`/health`, `/v1/models`, and `/stats` are available; tool calling is not
+offered to UIs because they cannot complete the tool round trip. Set
+`MEMORY_PROXY_ENABLED=0` for a read-only passthrough (no writes); override
+the listener with `MEMORY_PROXY_HOST`, `MEMORY_PROXY_PORT`, and
+`MEMORY_PROXY_UPSTREAM`.
+
 ## 6. CRAG (document research) — same server, zero extra VRAM
 
 Unchanged: `python main.py` (interactive), `python main.py --ingest-dir
@@ -236,8 +287,11 @@ python tool_runtime.py --demo "search for the newest nvidia driver and tell me b
 | `crag_vector_store/` | `retrieval.py` | chunked document index |
 | `models/` | `download_models.py` | STT + TTS model assets (only created dir) |
 
-No component writes another component's store; all paths resolve from the
-module directory, never the CWD.
+`memory_proxy.py` writes the same two stores from the UI path: turns with
+`verdict="UI"` and facts with `source="ui_auto"`. ULTRON's voice path keeps
+`verdict="VOICE"` / `source="voice_auto"`, so the origin of every row is
+visible. No component writes another component's store; all paths resolve
+from the module directory, never the CWD.
 
 ## 10. Troubleshooting
 
