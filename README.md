@@ -1,676 +1,699 @@
-# modern-crag
+# ULTRON — Local Voice Assistant (`tts_loop_agent`)
 
-A locally hosted, LangChain-based Retrieval-Augmented Generation system that replaces single-shot retrieval with an evaluation-driven control loop. Every retrieved chunk is graded by an LLM, weak context is rejected at three tiers, and knowledge gaps trigger query rewriting and live web search. Retrieval, grading, refinement and generation run locally through Ollama on consumer hardware (laptop CPU and a 6 GB GPU). Only the web fallback leaves the machine.
+A fully local, hardware-tuned voice stack for a 6 GB GPU: **Parakeet TDT STT →
+llama-server (Qwen3.5-4B) → Kokoro-82M TTS**, with genuine incremental
+streaming, tool calling (web search + personal memory), and an optional
+self-corrective RAG (CRAG) pipeline that shares the *same* llama-server — no
+second model is ever loaded onto the GPU.
 
-Built on: LangChain, Ollama, BAAI/bge-m3, ChromaDB (HNSW), DuckDuckGo and Tavily.
+Everything runs offline after one `python download_models.py --yes`. No
+Ollama, no cloud APIs (unless you supply a Tavily key), no VRAM contention
+between STT, LLM and TTS.
 
-The design follows Corrective RAG (Yan et al., 2024, arXiv:2401.15884) and replaces several of its components with choices suited to a single-GPU machine and a large personal PDF corpus.
+---
 
-Note on claims: no retrieval or answer-quality benchmark has been run. Comparisons below are structural. Timing figures in section 8 are single-run measurements on one machine.
+## Quickstart (TL;DR)
+
+```bash
+# 1. install deps (Python 3.11 env), then fetch ~2.8 GB of models
+pip install -r requirements.txt
+python download_models.py --yes          # Parakeet + Kokoro + .env
+
+# 2. launch the single inference server
+./start_llama.sh                          # llama.cpp + Qwen3.5-4B Abliterated
+
+# 3. run
+python ultron.py                          # full voice loop
+python selftest.py                        # offline 104 checks
+python test_streaming.py                  # offline 49 checks (real socket)
+python test_integration.py                # live PASS/FAIL/SKIP
+```
+
+Full instructions: **§9. Installation**, **§10. Configuration**.
 
 ---
 
 ## Table of Contents
 
-1. [Approach](#1-approach)
-2. [Architecture](#2-architecture)
-3. [Pipeline Stages](#3-pipeline-stages)
-4. [Data Flow](#4-data-flow)
-5. [Comparative Analysis](#5-comparative-analysis)
-6. [New Approaches](#6-new-approaches)
-7. [Hurdles and Fixes](#7-hurdles-and-fixes)
-8. [Performance Characteristics](#8-performance-characteristics)
-9. [Known Limitations and Future Work](#9-known-limitations-and-future-work)
-10. [Requirements](#10-requirements)
-11. [Setup](#11-setup)
-12. [Usage](#12-usage)
-13. [Configuration Reference](#13-configuration-reference)
-14. [Project Structure](#14-project-structure)
-15. [Troubleshooting Quick Reference](#15-troubleshooting-quick-reference)
-16. [Acknowledgements and Reference](#16-acknowledgements-and-reference)
+1. [What this repo is (and is not)](#1-what-this-repo-is-and-is-not)
+2. [System architecture](#2-system-architecture)
+3. [The voice turn, end to end](#3-the-voice-turn-end-to-end)
+4. [Streaming internals](#4-streaming-internals)
+5. [Tool-call lifecycle](#5-tool-call-lifecycle)
+6. [Memory architecture](#6-memory-architecture)
+7. [CRAG pipeline (optional)](#7-crag-pipeline-optional)
+8. [File map](#8-file-map)
+9. [Hardware and VRAM budget](#9-hardware-and-vram-budget)
+10. [Installation](#10-installation)
+11. [Configuration reference](#11-configuration-reference)
+12. [Testing](#12-testing)
+13. [Benchmarks](#13-benchmarks)
+14. [Troubleshooting](#14-troubleshooting)
+15. [Design guarantees](#15-design-guarantees)
+16. [Related repositories](#16-related-repositories)
 
 ---
 
-## 1. Approach
+## 1. What this repo is (and is not)
 
-Classical RAG is fire-and-forget: embed documents, retrieve top-k chunks, place them in a prompt, generate. It has no notion of whether the retrieved context answers the question. When retrieval fails, the generator either hallucinates or refuses, and the user cannot tell which happened.
+**It is:**
 
-This project treats retrieval as fallible and wraps it in an explicit control loop.
+- A **voice assistant runtime**: mic → STT → LLM (with tool calling) → TTS → speaker, wrapped in a single process (`ultron.py`).
+- A **streaming-first** implementation: `on_delta` fires the moment the first token arrives from llama-server, not after the response completes. The first clause reaches the speaker while the model is still generating.
+- A **single-server design**: one `llama-server` serves generation *and* embeddings; STT and TTS are small, co-resident models that never displace the LLM.
+- **Optional CRAG**: `main.py` provides an interactive, self-corrective RAG CLI on top of the same server — retrieval → grade → route → refine → web fallback → generate, plus an episodic temporal-memory log.
 
-Design principles:
+**It is not:**
 
-1. **Evaluate before generating.** An LLM evaluator scores every retrieved chunk on a 0.0 to 1.0 relevance scale before any context reaches the generator.
-2. **Reject progressively.** Irrelevant material is discarded at three granularities: chunk level (score gate, ranking, cap), sentence level (refinement), and source level (verdict routing).
-3. **Degrade explicitly.** Fallbacks announce themselves. Unparseable evaluator output prints a snippet of what the model returned. A failed web search produces a provenance notice in the answer. Total retrieval failure forces the generator to label its answer as unverified general knowledge.
+- A cloud assistant, a multi-tenant service, or a UI.
+- A wrapper around Ollama. `CRAG_BACKEND=ollama` exists as an explicit opt-in only, and no code path in this repo launches any model server other than the one you start yourself with `./start_llama.sh`.
 
-Pipeline summary:
+---
 
-1. Retrieve candidate chunks from the local vector store.
-2. Grade every candidate against the question with a local LLM.
-3. Drop weak chunks, then route on the grades.
-4. Refine surviving knowledge at sentence level.
-5. For AMBIGUOUS and INCORRECT verdicts, rewrite the question into a keyword query and search the web.
-6. Generate a grounded answer from the refined context only.
-7. If local and web retrieval both fail, say so and label the answer as unverified.
+## 2. System architecture
 
-Routing rule:
+```mermaid
+graph TD
+    subgraph Peripherals
+        MIC["Microphone<br/>16 kHz float32"]
+        SPK["Speaker<br/>24 kHz float32"]
+    end
 
-| Condition on chunk scores | Verdict | Knowledge used |
+    subgraph VoiceRuntime["Voice runtime (ultron.py)"]
+        STT["stt_engine<br/>Parakeet TDT 0.6B v3"]
+        CHK["SpeechChunker<br/>sentence/clause splitter"]
+        VC["voice_cache<br/>boot greeting + fillers"]
+        TTS["tts_engine<br/>Kokoro-82M"]
+        PLR["AudioPlayer<br/>threaded output"]
+    end
+
+    subgraph LLMLayer["LLM + tool layer"]
+        TR["tool_runtime<br/>SSE chat + tool loop + ULTRON prompt"]
+        TAV["tavily_tool<br/>web_search"]
+        MEM["memory_store<br/>memory_search / memory_add"]
+    end
+
+    subgraph Inference
+        LS["llama-server<br/>Qwen3.5-4B Abliterated Q4_K_M<br/>--jinja --embeddings --reasoning off --no-mmproj"]
+    end
+
+    subgraph Stores
+        MDB[("memory.db<br/>durable personal<br/>WAL, sha1 dedup")]
+        TDB[("iris_memory/temporal_memory.db<br/>episodic turn log<br/>+ PNG visual archive")]
+        VDB[("crag_vector_store/<br/>chroma + bge-m3 chunks")]
+    end
+
+    subgraph CRAG["CRAG CLI (optional)"]
+        MAIN["main.py<br/>interactive loop"]
+        ER["evaluator_router<br/>grade/refine/rewrite"]
+        GEN["generator<br/>grounded answer"]
+        RT["retrieval<br/>hybrid dense+BM25"]
+        TM["temporal_memory<br/>episodic store"]
+    end
+
+    MIC --> STT --> TR
+    TR <-->|"POST /v1/chat/completions (SSE)"| LS
+    TR -->|"on_delta"| CHK --> TTS --> PLR --> SPK
+    TR -->|"on_tool_start"| VC --> PLR
+    TR -->|web_search| TAV
+    TR -->|memory_*| MEM
+    MEM <--> MDB
+    MAIN <--> LS
+    MAIN --> ER --> GEN
+    MAIN --> RT <--> VDB
+    MAIN --> TM <--> TDB
+```
+
+**Component roles**
+
+| Component | Language | Responsibility |
 |---|---|---|
-| max(score) >= 0.7 | CORRECT | Refined local chunks |
-| all scores < 0.3 | INCORRECT | Web results only |
-| otherwise | AMBIGUOUS | Refined local chunks plus web results |
+| `stt_engine.py` | Python (torch + transformers) | Parakeet TDT loading, resampling to 16 kHz, transcription, RTF metrics |
+| `tts_engine.py` | Python (pykokoro / kokoro) | Kokoro-82M synthesis, phoneme-noise suppression, per-call TTFA/RTF |
+| `voice_cache.py` | Python | Pre-renders boot greeting + three filler lines; hot-loaded at ~0 ms on tool start |
+| `ultron.py` | Python | Orchestrates the mic→LLM→speaker loop; owns conversation history |
+| `tool_runtime.py` | Python (requests) | Incremental SSE client, `ThinkFilter`, `ToolCallMerger`, history trimmer, `chat()` |
+| `tavily_tool.py` | Python (requests) | `web_search` tool implementation (SDK + REST + keyless fallback) |
+| `memory_store.py` | Python (sqlite3) | Durable personal memory + `memory_search` / `memory_add` tools |
+| `memory_import.py` | Python | Importers for ChatGPT / Claude / Gemini / generic JSON / plain text |
+| `main.py` + `evaluator_router` + `generator` + `retrieval` + `temporal_memory` | Python | CRAG pipeline (see §7) |
+| `start_llama.sh` | bash | Launches `llama-server` with the required flags; pre-flight, health wait, clean shutdown |
+| `monitor_gpu.sh` | bash | Time-series VRAM/RAM sampler for benchmarks |
 
 ---
 
-## 2. Architecture
+## 3. The voice turn, end to end
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant M as Mic (16 kHz)
+    participant S as stt_engine
+    participant UL as ultron.py
+    participant TR as tool_runtime
+    participant LS as llama-server
+    participant VC as voice_cache
+    participant TAV as tavily/memory
+    participant CH as SpeechChunker
+    participant TT as tts_engine
+    participant SP as Speaker (24 kHz)
+
+    U->>M: speaks
+    M->>S: RMS-gated float32 chunks
+    S-->>UL: transcript
+    UL->>TR: chat(system + history[-6:] + user)
+    TR->>LS: POST /v1/chat/completions (stream=true)
+
+    LS-->>TR: first SSE token (~TTFT)
+    TR->>CH: on_delta(piece)
+    CH->>TT: first clause (split on .!? , ; :)
+    TT->>SP: audio → play
+
+    Note over TR,LS: model decides to call a tool
+    TR->>VC: on_tool_start(name)
+    VC->>SP: play filler[0] (~0 ms, np.load)
+    TR->>TAV: execute_tool(name, args)
+    TAV-->>TR: JSON result
+    TR->>LS: assistant.tool_calls + tool reply
+    LS-->>TR: continuation stream
+
+    loop until finish_reason=stop
+        TR->>CH: on_delta(piece)
+        CH->>TT: clause
+        TT->>SP: audio
+    end
+
+    UL->>UL: append (user, assistant) to history
+    UL->>SP: player.wait_idle()
+```
+
+**Latency budget** (default 16k ctx, STT on CPU when llama-server holds the GPU):
+
+| Stage | Typical | Notes |
+|---|---|---|
+| Parakeet STT (short utterance) | 0.3–0.6 s | RTF reported in `stt_engine.ParakeetSTT.last` |
+| LLM TTFT | 0.1–0.3 s | measured in `tool_runtime.LAST_STATS["ttft_ms"]` |
+| First clause synthesis (Kokoro on CUDA) | ~0.1 s | RTF from `tts_engine.METRICS.summary()` |
+| First clause synthesis (Kokoro on CPU) | ~0.5 s | still faster than real time |
+| **Time to first audible word** | **~0.6–1.2 s** | end-to-end, incl. STT |
+
+Clause splitting is aggressive (`.!?` and also `,;:`) precisely so the first synthesizable unit arrives fast. The trade-off is occasionally choppy prosody; the alternative — waiting for a full sentence — costs hundreds of ms.
+
+---
+
+## 4. Streaming internals
+
+`tool_runtime.stream_completion()` is the *only* LLM transport in this repo. It is proven to be genuinely incremental by `test_streaming.py`, including a real-socket test where the first callback fires **350 ms before** the server writes its second event.
+
+```mermaid
+flowchart LR
+    A["raw bytes<br/>from socket"] --> B["SSEDecoder.feed<br/>incremental utf-8"]
+    B --> C{"blank line<br/>(event terminator)?"}
+    C -->|no| D["buffer line"]
+    C -->|yes| E["join data: lines"]
+    E --> F{"payload == [DONE]?"}
+    F -->|yes| Z["stop"]
+    F -->|"json.loads"| G["ThinkFilter.feed<br/>removes &lt;think&gt; blocks"]
+    G --> H["yield {type: text, delta}"]
+    E --> I["ToolCallMerger.feed_delta<br/>by index"]
+    I --> J["yield {type: tool_call, delta}"]
+    E --> K["yield {type: reasoning, delta}"]
+    K --> L["dropped by chat()"]
+```
+
+Key properties guaranteed by the decoder (all covered by tests):
+
+1. **Every-byte splits**: a single SSE transcript split at every possible byte boundary yields the same event sequence.
+2. **UTF-8 reassembly**: multi-byte characters split across chunks (e.g. inside `☕`'s 4 bytes) decode correctly.
+3. **Missing final newline**: an event terminated only by EOF is recovered.
+4. **Comments and keep-alives** (`: ping`) are ignored.
+5. **`reasoning_content`** is routed to a separate event type and **dropped** before it can reach `on_delta` → TTS.
+6. **`<think>…</think>` blocks** are removed by a streaming state machine that tolerates arbitrary splits (including inside the open/close tags themselves).
+7. **HTTP response is closed** on success, on error, on mid-stream drop, and when `on_delta` raises (cancellation).
+8. **Malformed tool-call JSON is never executed**; the model receives a `malformed tool arguments` tool message and can reissue.
+
+`chat()` also bounds conversation size: `trim_history()` keeps every leading system message plus the newest turns within `IRIS_HISTORY_TURNS=24` and `IRIS_HISTORY_CHARS=24000`, and never orphans a `tool` message from the `assistant` message that issued it.
+
+Per-turn latency stats are written to `tool_runtime.LAST_STATS`:
+
+```python
+{"ttft_ms": 214.7,
+ "total_ms": 1893.1,
+ "chars": 245,
+ "rounds": [{"round": 0, "ttft_ms": 214.7, "gen_ms": 512.3,
+             "chars": 168, "tool_calls": 1, "error": None},
+            {"round": 1, "ttft_ms": 401.2, "gen_ms": 730.1,
+             "chars": 77,  "tool_calls": 0, "error": None}]}
+```
+
+---
+
+## 5. Tool-call lifecycle
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant TR as tool_runtime.chat
+    participant LS as llama-server
+    participant MER as ToolCallMerger
+    participant EX as execute_tool
+    participant TAV as tavily / memory
+
+    TR->>LS: POST with tools=[web_search, memory_search, memory_add]
+    loop SSE stream
+        LS-->>TR: delta.content "Accessing the network."
+        TR->>TR: on_delta → chunker → TTS
+        LS-->>TR: delta.tool_calls[0].function.name = "web_search"
+        LS-->>TR: delta.tool_calls[0].function.arguments = "{\"qu"
+        LS-->>TR: delta.tool_calls[0].function.arguments = "ery\":\"latest python\"}"
+        TR->>MER: feed each fragment
+    end
+
+    MER-->>TR: complete call {id, name, arguments}
+    TR->>TR: json.loads(arguments); reject if not an object
+    TR->>TR: on_tool_start("web_search")
+    TR->>EX: execute_tool("web_search", {"query": "latest python"})
+    EX->>TAV: run_tool(args)
+    TAV-->>EX: {"ok": true, "results": [...], "_ms": 843}
+    EX-->>TR: result
+    TR->>TR: on_tool_end(name, result)
+    TR->>LS: assistant message (content + tool_calls)
+    TR->>LS: tool message (tool_call_id + result JSON)
+
+    loop up to max_tool_rounds (default 3)
+        LS-->>TR: continuation stream
+        TR->>TR: on_delta → chunker → TTS
+    end
+```
+
+**Why the filler is essential.** A tool call is 0.5–3 s of silence between the model's "Accessing the network." and its synthesized answer. `on_tool_start` fires before `execute_tool()`, and `ultron.py` responds by playing `voice_cache.get_filler()[0]` — a ~0.8 s pre-rendered Kokoro line — masking the dead air completely. The filler path costs one `np.load` call.
+
+**Tool registry** (`tool_runtime.tool_schemas()`):
+
+| tool | implementation | behavior |
+|---|---|---|
+| `web_search` | `tavily_tool.run_tool` | Tavily SDK → REST (key or keyless) → empty-result honest response with `guidance` |
+| `memory_search` | `memory_store.run_tool` | hybrid retrieval over `memory.db` (see §6) |
+| `memory_add` | `memory_store.run_tool` | dedup by content hash, returns `{ok: true, id}` or `already known, not duplicated` |
+
+---
+
+## 6. Memory architecture
+
+Three stores, three owners, no cross-writes:
+
+```mermaid
+graph LR
+    subgraph Durable["Durable personal memory"]
+        MS["memory_store.py<br/>hybrid search + tools"]
+        MI["memory_import.py<br/>ChatGPT/Claude/Gemini/text"]
+        MDB[("memory.db<br/>WAL, sha1 dedup, embedding BLOB")]
+        MI -->|add_many| MS --> MDB
+    end
+
+    subgraph Episodic["Episodic CRAG memory"]
+        TM["temporal_memory.py<br/>turn log + temporal injector"]
+        TDB[("iris_memory/temporal_memory.db<br/>sessions, queries, answers, timestamps")]
+        PNG[("visual_memory/**/*.png<br/>turn-by-turn image archive")]
+        TM --> TDB
+        TM -->|daemon thread| PNG
+    end
+
+    subgraph Docs["Document index"]
+        RT["retrieval.py<br/>hnsw + bm25 hybrid"]
+        VDB[("crag_vector_store/<br/>chunked docs, bge-m3 vectors")]
+        RT <--> VDB
+    end
+
+    TR["tool_runtime"] -->|memory_search/add| MS
+    UL["ultron.py"] --> MS
+    CM["main.py"] --> TM
+    CM --> RT
+    ER["evaluator_router"] -->|keyword + recency| TM
+```
+
+**Retrieval (memory_store.search)**
+
+Hybrid score per row:
+
+```
+score = 0.75·cos(q, emb)
+      + 0.15·importance
+      + 0.10·recency(1 / (1 + days_since / 90))
+      + 0.15·keyword_hit (bm25 via FTS5)
+```
+
+Rows with neither dense cosine nor a keyword hit are excluded — no zero-signal junk in the top-k. Embedding dimension is validated on first write; a mismatched stored vector degrades gracefully to keyword-only for that row.
+
+**Recency + keyword overlay (temporal_memory.search)**
+
+For CRAG’s episodic store the blend is:
+
+```
+score = 0.72·keyword_overlap + 0.28·0.5^(age_days / 14)
+```
+
+`RECENCY_HALF_LIFE_DAYS=14` is the “soft forgetting” knob — memory doesn’t decay, but retrieval weight does. A date expression in the query (`yesterday`, `last tuesday`, `3 weeks ago`, `in january`) narrows the SQL window first; if the window is empty, it falls back to keyword + recency.
+
+**Session model** — `temporal_memory.begin_turn()` starts a new session after `CRAG_SESSION_IDLE_MINUTES=30` of inactivity, and the temporal injector block handed to the generator includes the current time, the humanized time since the last interaction, and the session’s turn count.
+
+---
+
+## 7. CRAG pipeline (optional)
+
+`main.py` provides an interactive CLI for document-grounded research. It shares the same llama-server as the voice runtime — no second model, no VRAM cost.
 
 ```mermaid
 flowchart TD
-    subgraph Ingestion
-        D[Directory of txt, md, pdf] --> M{Manifest check<br/>mtime and size}
-        M -->|unchanged| SKIP[Skip file]
-        M -->|new or changed| PW[Process pool, spawn<br/>load, split, hash ids, dedupe]
-        PW --> EMB[bge-m3 embeddings<br/>GPU fp16, batched]
-        EMB --> VS[(ChromaDB<br/>HNSW cosine)]
-        EMB --> MAN[Atomic manifest write]
-    end
+    Q["user query"] --> R{"classify_query<br/>(regex router, no LLM)"}
+    R -->|simple| D["direct answer<br/>TIME block only"]
+    R -->|memory| ME["memory.recall(query)<br/>+ recent turns"]
+    R -->|standard| GR["retrieval.retrieve<br/>dense (bge-m3) + bm25 → RRF"]
 
-    subgraph Query
-        Q[User query] --> RET[Retrieve top-k]
-        VS --> RET
-        RET --> GR[Batched LLM grader<br/>scores plus search query]
-        GR --> T1[Tier 1: chunk rejection<br/>drop below 0.3, rank, cap 8]
-        GR --> RT{Tier 3: router}
-        T1 --> RL[Tier 2: sentence refinement<br/>local]
-        RT -->|CORRECT| RL
-        RT -->|AMBIGUOUS| RL
-        RT -->|AMBIGUOUS| WEB[Web search<br/>DuckDuckGo, Tavily fallback]
-        RT -->|INCORRECT| WEB
-        WEB --> RW[Tier 2: sentence refinement<br/>web]
-        WEB -->|empty| CB[Circuit breaker<br/>notice or parametric fallback]
-        RL --> CTX[Context blocks]
-        RW --> CTX
-        CB --> CTX
-        CTX --> GEN[Generator<br/>streamed, injection-hardened prompt]
-        GEN --> OUT[Answer, sources, trace]
-    end
+    GR --> GD["grade_documents<br/>llama-server temp 0, JSON"]
+    GD --> V{"route_verdict<br/>upper=0.7, lower=0.3"}
+
+    V -->|CORRECT| RF["refine_knowledge<br/>keep relevant sentences"]
+    V -->|AMBIGUOUS| RF
+    V -->|AMBIGUOUS / INCORRECT| WS["web_search_ddg<br/>→ tavily fallback"]
+
+    RF --> GEN["generate_answer<br/>streamed via tool_runtime"]
+    WS --> GEN
+    WS -.->|empty| PARAM["parametric fallback<br/>system notice injected"]
+    PARAM --> GEN
+    ME --> GEN
+    D --> GEN
+
+    GEN --> SAVE["temporal_memory.save_turn<br/>SQLite + PNG archive"]
+    SAVE --> OUT["streamed output"]
 ```
 
-Four modules, one responsibility each:
+**Routing categories** (`classify_query`):
 
-| File | Responsibility | Key components |
+| kind | trigger | action |
 |---|---|---|
-| `retrieval.py` | Ingestion and vector search | PyMuPDF and TextLoader, RecursiveCharacterTextSplitter (800/150), SentenceTransformer bge-m3 (fp16, GPU), ChromaDB persistent HNSW (cosine), incremental sync manifest, process-pool parsing |
-| `evaluator_router.py` | Evaluation, routing, refinement, fallback | LLM chunk grader (0.0 to 1.0), threshold router, sentence-level refiner, query rewriter, DuckDuckGo and Tavily search chain |
-| `generator.py` | Grounded synthesis | Hardened system prompt, context and question delimiters, token-streamed generation, source formatting |
-| `main.py` | Orchestration and CLI | Pipeline control flow, chunk selection, circuit breakers, interactive loop, startup menu |
+| `simple` | greeting, casual, identity, current time, pure arithmetic | skip retrieval; answer from prompt + TIME block |
+| `memory` | references past conversation (`do you remember`, `last time`, `what did we discuss`) | recall from `temporal_memory`; no grading |
+| `standard` | everything else | full CRAG control plane |
+
+**Verdict thresholds** (`route_verdict`): `CORRECT` if max score ≥ 0.7; `INCORRECT` if all scores < 0.3; `AMBIGUOUS` otherwise. `AMBIGUOUS` keeps both local and web contexts, with web preferred when verdict is `INCORRECT`.
+
+**Live web fallback** tries `ddgs` first, then `tavily_tool.search()` if a key is configured, then the parametric-fallback notice. `_normalize` bounds every response so tool results cannot crowd the LLM context.
 
 ---
 
-## 3. Pipeline Stages
+## 8. File map
 
-### 3.1 Ingestion (`retrieval.py`)
-
-- Discovers `.txt`, `.md`, `.pdf` recursively.
-- Compares each file's `mtime` and `size` with `manifest.json`. Unchanged files are skipped. Deleted files have their vectors removed.
-- Workers run in a `ProcessPoolExecutor` with the `spawn` context. Each worker loads the file (`PyMuPDFLoader` for PDF, `TextLoader` with `chardet` for text), splits it with `RecursiveCharacterTextSplitter` (800 characters, 150 overlap), and builds MD5 chunk ids with in-file deduplication.
-- The main process embeds chunks with `BAAI/bge-m3` (normalized, batch 64, fp16 on CUDA) and writes to Chroma in batches of 500.
-- The manifest is written atomically (`manifest.json.tmp`, then `os.replace`) after each file, so an interrupt keeps all completed work.
-- A failed embedding write rolls back the ids already written for that file.
-
-### 3.2 Retrieval
-
-`similarity_search_with_score` on a Chroma collection with HNSW parameters `M=16`, `construction_ef=200`, `search_ef=64` (configurable), cosine space. Default `k=8`.
-
-### 3.3 Grading (`evaluator_router.py`)
-
-- One listwise call grades up to 12 chunks, each truncated to 600 characters.
-- The model returns strict JSON with a score per chunk and a keyword `search_query` for the web, in the same response.
-- Bands: 0.7 to 1.0 answers the question, 0.3 to 0.69 is partial background, below 0.3 is noise.
-- Temperature 0.0, thinking disabled.
-
-Failure handling, in order:
-
-1. JSON-mode call, parsed by a tolerant extractor that strips markdown fences and surrounding prose.
-2. If unparseable, a second text-mode call asking for comma-separated scores, parsed with regex.
-3. If that also fails, neutral 0.5 scores for all chunks. This forces an AMBIGUOUS verdict and therefore a web search.
-
-### 3.4 Tier 1 rejection and routing
-
-Chunks scoring below 0.3 are dropped. The remainder is sorted by score and capped at 8. `route_verdict` then applies the table in section 1.
-
-### 3.5 Tier 2 refinement
-
-- Selected chunks are split into sentences, capped at 50.
-- The model returns the ids of sentences worth keeping, JSON first, then a comma-separated text fallback.
-- If both passes fail, all sentences are kept. If the model returns an empty list, that source contributes nothing.
-- This strips the side information that chunk overlap drags in.
-
-### 3.6 Web fallback
-
-- The query comes from the grader's `search_query`. If absent, a dedicated rewrite call produces one.
-- DuckDuckGo is tried twice with an 8 second timeout. If it returns nothing, Tavily is tried when `TAVILY_API_KEY` is set.
-- Result titles and snippets go through the same sentence refinement. If refinement removes everything, unfiltered snippets are used and labeled as such.
-
-### 3.7 Circuit breakers
-
-If web search returns nothing:
-
-- With refined local context available (AMBIGUOUS route), a notice states that the web was unavailable and the local content was only partly relevant.
-- With no context at all, the generator is switched to PARAMETRIC FALLBACK and must state that the answer is unverified general knowledge.
-
-### 3.8 Generation (`generator.py`)
-
-- Streams tokens from a local Ollama model.
-- Context and question are wrapped in `<<<CONTEXT_BEGIN>>>` and `<<<QUESTION_BEGIN>>>` delimiters.
-- The system prompt treats everything inside the delimiters as untrusted data, forbids persona switching and configuration disclosure, and forbids fabricated source names.
-
----
-
-## 4. Data Flow
-
-### 4.1 Query path
-
-```
-query
-  -> embed query (bge-m3)
-  -> Chroma top-k (cosine)                          list[chunk]
-  -> grader (1 LLM call)                            scores[], search_query
-  -> tier 1: keep >= 0.3, sort desc, cap 8          selected_chunks
-  -> route_verdict(scores)                          CORRECT | AMBIGUOUS | INCORRECT
-  -> if CORRECT or AMBIGUOUS:
-        tier 2: refine(selected_chunks)             local_refined
-  -> if AMBIGUOUS or INCORRECT:
-        web_search(search_query)                    results[]
-        tier 2: refine(results)                     web_refined
-  -> assemble context_blocks, sources, notice
-  -> generator.stream(query, context_blocks)        tokens
-  -> print sources and elapsed time
-```
-
-Context layout passed to the generator:
-
-```
-[SOURCE 1: local documents]
-<refined local sentences>
-
-[SOURCE 2: live web results]
-<refined web sentences>
-```
-
-A "context block" is an assembled unit (refined local text, refined web text, or a system notice). It is not a retrieved chunk. The trace line `generating answer from N context block(s)` counts these.
-
-LLM calls per query: 1 grading call, up to 2 refinement calls (local and web), 0 or 1 rewrite call, 1 generation call. Each control call retries in text mode on a parse failure.
-
-### 4.2 Ingestion path
-
-```
-directory scan (.txt .md .pdf, recursive)
-        |
-        v
-manifest check (mtime + size per file) ---> unchanged: skip, no re-embedding
-        |
-        v
-PROCESS POOL (spawn, x4):            MAIN PROCESS (serial):
-  PyMuPDF / TextLoader parse           delete previous ids for the file
-  recursive split (800/150)            GPU fp16 batch-64 embedding
-  md5 chunk ids                        Chroma writes (batches of 500)
-  per-file chunk dedup                 rollback on failed write
-                                       manifest checkpoint after every file
-```
-
-Parsing is CPU-bound and GIL-hostile, embedding is GPU-bound, so they overlap. The main process embeds one file while workers parse the next, with a bounded in-flight window of `2 x workers` files to cap memory.
-
-Chunk ids are `md5(abspath::chunk_text)`. Writes delete a file's previous ids first, so re-runs and re-ingests do not duplicate vectors. Interrupted runs lose at most the file in progress.
-
----
-
-## 5. Comparative Analysis
-
-### 5.1 Against naive RAG
-
-| Dimension | Naive RAG | This pipeline |
+| File | Category | Role |
 |---|---|---|
-| Retrieval | Single shot, top-k, unconditional | Top-k, then LLM evaluation of every chunk |
-| Trust in retrieval | Assumed correct | Assumed fallible, verified per chunk |
-| Context construction | All k chunks forwarded | Three tiers: chunk (score gate, ranking, cap), sentence (filter and recompose), source (verdict routing) |
-| Failure handling | Hallucination or silent refusal | Routing to query rewrite and web fallback, circuit breakers, labeled parametric mode |
-| Query transformation | None, raw user query | Keyword rewrite fused into the grading call |
-| External knowledge | None | DuckDuckGo chain with optional Tavily fallback |
-| Ingestion | Batch script, full re-run | Incremental manifest, deleted-file pruning, per-file checkpoints, partial-write rollback |
-| Ingestion parallelism | Sequential | Process-pool parsing overlapped with GPU embedding |
-| Observability | None | Trace of per-chunk scores, kept and dropped counts, verdict, rewritten query, result counts, timing |
-| Output discipline | Prompt-dependent | Delimited context, grounding rules, no fabricated source names |
-| Security | None | Untrusted-data framing at every LLM boundary, persona lock (prompt level) |
-| GPU handling | Default placement | fp16 embeddings, configurable batch size, CPU fallback |
+| `ultron.py` | Runtime | Main orchestrator: mic → STT → `chat()` → chunker → TTS → speaker; owns history |
+| `stt_engine.py` | Runtime | Parakeet TDT 0.6B v3 (transformers-native), CUDA/CPU auto, RTF metrics |
+| `tts_engine.py` | Runtime | Kokoro-82M via pykokoro (primary) or `kokoro` (fallback); 24 kHz float32 |
+| `voice_cache.py` | Runtime | Pre-renders boot greeting + 3 fillers; singleton `get_filler(idx)` |
+| `enroll_voice.py` | Setup | One-time clip enrollment: AkinVox → Inno → static fallback ladder |
+| `download_models.py` | Setup | Fetches Parakeet (~2.4 GB) + Kokoro (~360 MB), writes `.env` |
+| `tool_runtime.py` | LLM | SSE client, `ThinkFilter`, `ToolCallMerger`, history trimmer, `chat()` |
+| `tavily_tool.py` | Tools | `web_search` implementation + `speakable()` digest |
+| `memory_store.py` | Memory | Durable personal memory + `memory_search` / `memory_add` tools |
+| `memory_import.py` | Memory | Importers for ChatGPT / Claude / Gemini / generic / plain text |
+| `main.py` | CRAG | Interactive CRAG CLI (uses `evaluator_router`, `generator`, `retrieval`) |
+| `evaluator_router.py` | CRAG | Grading, refinement, query rewriting, adaptive router, web fallback |
+| `generator.py` | CRAG | Grounded answer generation via `tool_runtime.stream_completion` |
+| `retrieval.py` | CRAG | ChromaDB + bge-m3 dense + BM25 hybrid (RRF fusion) |
+| `temporal_memory.py` | CRAG | Episodic turn log (SQLite WAL) + PNG visual archive + temporal injector |
+| `iris_config.py` | Config | `.env` loader, scrubbers, memory map, history/retry policy, `.env` editor |
+| `start_llama.sh` | Infra | Launcher with pre-flight, health wait, clean Ctrl+C shutdown |
+| `monitor_gpu.sh` | Infra | CSV sampler of VRAM / RAM / per-process GPU memory |
+| `selftest.py` | Test | 104 offline checks (config, memory, import, tools, streaming, voice logic) |
+| `test_streaming.py` | Test | 49 checks proving genuine SSE incrementality, incl. real-socket test |
+| `test_integration.py` | Test | Live suite; each check is labeled PASS / FAIL / SKIP (with reason) |
+| `bench_first_token.py` | Bench | TTFT + chars/sec against llama-server |
+| `bench_retrieval.py` | Bench | Recall@1/3/5 + MRR on synthetic memories (`--fake`, real, `--compare`) |
+| `INTEGRATION.md` | Doc | Deployment guide, VRAM ledger, troubleshooting |
+| `AUDIT_REPORT.md` | Doc | Line-by-line audit of critical issues and their fixes |
+| `requirements.txt` | Deps | Full voice + CRAG stack (CUDA 12.4, Python 3.11) |
 
-Structurally, the change is from a linear pipeline to a feedback control loop. The evaluator sits between retrieval and generation, its output drives branching, and the loop closes through the web fallback that repairs gaps the local store cannot cover.
+---
 
-### 5.2 Against the original CRAG design
+## 9. Hardware and VRAM budget
 
-The left column summarizes Yan et al. (2024). Verify details against the paper.
+Designed around a **6 GB GPU** (RTX 4050 Max-Q in development).
 
-| Component | Original CRAG | This implementation |
+| Resident | Approx. VRAM | Notes |
 |---|---|---|
-| Retrieval evaluator | Fine-tuned lightweight T5-based scorer on query-document pairs | Zero-shot local LLM (`gemma4:e4b` by default) through Ollama, no fine-tuning |
-| Grading call shape | Independent pair scoring | One listwise call over all candidates |
-| Evaluator output | One confidence score per document | Per-chunk scores plus a keyword web query in one response |
-| Evaluator robustness | Not a concern with a fine-tuned scorer | Three transport tiers, JSON then text-mode parsing, neutral 0.5 as last resort |
-| Thresholds and actions | Upper and lower thresholds, three actions | Same three actions. Constants 0.7 and 0.3, max-based CORRECT, all-below-lower INCORRECT |
-| Knowledge refinement | Decompose into strips, score strips, recompose | Sentence split, LLM returns ids to keep, JSON then text fallback, keep-all on total failure |
-| Chunk-level gate | Not described as a separate step, as far as I know | Explicit drop below 0.3, rank, cap, before refinement |
-| Query rewriting | Separate rewrite step before web search | Folded into grader output, standalone rewrite kept as fallback |
-| Web search | Commercial search API | DuckDuckGo first, optional Tavily, retry with timeout, no key required |
-| Total failure behavior | Not specified | Circuit breaker, user-facing notice, labeled parametric fallback |
-| Knowledge base | Fixed corpus | Incremental ingestion, process-pool parsing, atomic checkpoints, rollback |
-| Hardware target | Research setup | Single consumer GPU, fp16 embeddings, local generator, bounded context |
-| Generator safety | Not addressed | Delimited untrusted-input prompt, anti-injection and anti-disclosure rules |
+| `llama-server` (Qwen3.5-4B Abliterated Q4_K_M) | **~3.0 GB** | 2.52 GB weights + 272 MiB KV @ 16k/q8_0 + ~200 MB buffers |
+| Kokoro-82M (ONNX, CUDA provider) | ~0.4 GB | falls back to CPU transparently |
+| Parakeet TDT 0.6B (fp16 CUDA) | ~1.3 GB | auto-falls to CPU if `< STT_VRAM_MIN_MB` free |
+| **Total** | **~4.7 GB of 6 GB** | ~1.3 GB headroom |
 
-Consequence of replacing a fine-tuned T5 evaluator with a prompted LLM: no training data is needed and the evaluator is flexible, but its output format is non-deterministic and its scores are uncalibrated. Most of the parsing and fallback machinery in `evaluator_router.py` exists because of that trade.
+The **`--no-mmproj`** flag in `start_llama.sh` is not cosmetic: Qwen3.5 is a VL model, and without it llama.cpp auto-loads a ~650 MiB vision projector and warms it up with a dummy 1472×1472 image, costing ~900 MiB and leaving ~104 MiB free. The server then dies with `CUDA error: out of memory` under ordinary load. Removing the projector is the single change that makes STT + TTS + LLM co-resident.
 
----
+`--pooling mean` is likewise required: the model’s default pooling is `none`, which llama.cpp rejects for the OpenAI-compatible `/v1/embeddings` route. Without it, `memory_store` degrades to keyword-only mode (which still works — `backfill` restores vectors later).
 
-## 6. New Approaches
+Hardware knobs when VRAM is tight:
 
-Beyond the standard CRAG formulation (evaluator, thresholds, decompose-filter-recompose, web fallback), this implementation adds:
-
-1. **Fused evaluator and rewriter.** The grading call also emits the web query. On fallback routes this removes one LLM round trip. The standalone rewriter remains as a fallback.
-2. **A chunk-level rejection tier before refinement.** Whole chunks below 0.3 are discarded and the rest are re-ranked, so the sentence refiner only processes chunks that already earned their place.
-3. **Listwise grading.** The model sees all candidates in one prompt and scores them relative to each other.
-4. **Dual-protocol structured output with degradation.** Control calls use the raw Ollama chat API with `think=False`, retry without `think`, then fall back to LangChain `ChatOllama`. If JSON still fails to parse, a text-mode re-prompt asks for comma-separated values. The last resort is a neutral score that routes to more evidence, not less.
-5. **Id-based sentence selection.** The refiner returns integers, not rewritten text, so it cannot alter or invent source sentences.
-6. **Explicit failure signaling.** Parse failures print a snippet of the raw model output, and the neutral-score fallback prints a message. This was a real failure mode: a broken grader defaulted every chunk to 0.5, which forced the AMBIGUOUS route on every query.
-7. **Distinct circuit-breaker notices.** A web outage with usable local context and a total retrieval failure produce different, explicit messages.
-8. **Interrupt-safe incremental ingestion.** `(mtime, size)` change detection, deletion tracking, per-file atomic checkpoints, partial-write rollback.
-9. **Pipelined parallel ingestion with bounded memory.** Spawn-context process pool overlapped with serial GPU embedding, windowed at `2 x workers` files in flight.
-10. **Adaptive embedding loader.** Prefers fp16 on CUDA, falls back to fp32 and CPU, tries local-only weights before network access, and converts the torch CVE-2025-32434 load error into an actionable message.
-11. **Prompt-injection-aware generation.** Delimited context, untrusted-data framing in every control prompt, persona and disclosure locks.
-12. **Terminal UX for a local pipeline.** Dual `rich` progress bars (files and per-chunk embedding) with a plain-text renderer for non-TTY output, and token-streamed answers.
+- `IRIS_CTX=8192 ./start_llama.sh` — halves KV cache
+- `STT_DEVICE=cpu` — Parakeet tolerates short utterances on CPU
+- `TTS_PROVIDER=cpu` — Kokoro is real-time fast on CPU
+- `--ot per_layer_token_embd.weight=CPU` in `start_llama.sh` — offloads ~300 MB to RAM
 
 ---
 
-## 7. Hurdles and Fixes
+## 10. Installation
 
-Each item is written as symptom, root cause, resolution.
+### Prerequisites
 
-### 7.1 Ingestion took 40 to 50 minutes for 2 PDFs
+- Fedora 44 (or any distro with CUDA 12.4 and Python 3.11)
+- Python 3.11 conda env (`conda activate iris`)
+- `llama.cpp` built at `~/llama.cpp` (`build/bin/llama-server` exists)
+- Optional but recommended: `sudo dnf install espeak-ng ffmpeg`
 
-- **Symptom:** More than 20 minutes per PDF.
-- **Root cause:** `PyPDFLoader` uses pure-Python `pypdf`, runs sequentially under the GIL, and embeddings ran on CPU.
-- **Resolution:** Switched to `PyMuPDFLoader` (C-based MuPDF), moved from threads to `ProcessPoolExecutor` (`pool_kind="process"`), and enabled CUDA fp16 batched embeddings.
-
-### 7.2 `Torch not compiled with CUDA enabled`
-
-- **Symptom:** Fatal error on engine start, or embeddings silently running on CPU with no GPU utilization.
-- **Root cause:** Default `pip install torch` on Windows installs a CPU-only wheel, and a plain version specifier accepts `+cpu` builds, so a CPU torch satisfied the requirement.
-- **Resolution:** Pinned `torch==2.6.0+cu124` through the PyTorch CUDA 12.4 index. The local-version pin makes the requirements file reject CPU wheels. The loader also checks `torch.cuda.is_available()` and falls back to CPU.
-
-### 7.3 `torch.load` refusal (CVE-2025-32434)
-
-- **Symptom:** Startup error. Transformers refuses to load `pytorch_model.bin` weights on torch below 2.6.
-- **Root cause:** bge-m3 ships `.bin` weights and older torch blocks `torch.load` on them because of the vulnerability.
-- **Resolution:** torch 2.6 or newer, plus a specific error message at model load that names the fix.
-
-### 7.4 Unexpected Hugging Face network calls
-
-- **Symptom:** Unauthenticated-request warnings despite a locally cached model.
-- **Root cause:** Hugging Face sends a HEAD request on load to validate the cache.
-- **Resolution:** The loader tries `local_files_only=True` first. It goes online only if the local load fails.
-
-### 7.5 Telemetry errors and log flooding
-
-- **Symptom:** Repeated `Failed to send telemetry event ... capture() takes 1 positional argument`, and a flood of `Delete of nonexisting embedding ID` warnings burying the progress UI.
-- **Root cause:** A `posthog` 3.x signature change against `chromadb` 0.5.x, plus per-id warnings from the pre-delete that makes ingestion idempotent.
-- **Resolution:** `posthog<3` pin, `anonymized_telemetry=False` through both environment and client settings, and the `chromadb` logger clamped to ERROR.
-
-### 7.6 `Expected IDs to be unique, found duplicates ... in upsert`
-
-- **Symptom:** Chroma batch write failed on a multi-page PDF.
-- **Root cause:** Chunk ids are MD5 of `path::text`. Repeated headers, footers, licenses, slide templates and blank regions produce identical chunk text within one file, so ids collided inside a batch.
-- **Resolution:** A per-file `seen_ids` set in the worker drops duplicate chunks before they reach the store, so every id in a batch is unique.
-
-### 7.7 Evaluator scores stuck at 0.50 and a frozen AMBIGUOUS verdict
-
-- **Symptom:** Trace showed `chunk scores: 0.50, 0.50, 0.50, 0.50` and verdict AMBIGUOUS on every query, which looked hardcoded. The plain-text rewriter worked while grading failed.
-- **Root cause:** The model emitted markdown fences or reasoning text around the JSON, and reasoning tokens produced by default conflicted with JSON-mode output. The strict parser failed and the neutral fallback fired, swallowing the failure. Separately, "2 context blocks" in the trace had been read as 2 retrieved documents. It counts assembled blocks, not chunks.
-- **Resolution:** Tolerant JSON extraction with fence stripping, a second text-mode scoring pass, `think=False`, bounded `num_predict`, diagnostics that print the raw response, and retrieval depth raised from 4 to 8 or more through `--k`.
-
-### 7.8 Incremental sync appeared to re-chunk all 101 files
-
-- **Symptom:** After adding 2 files to a folder of 99 PDFs, progress jumped to 99/101 almost immediately.
-- **Root cause:** Not a defect. Unchanged files are checked by `(mtime, size)` and skipped, which took about 22 seconds in total. The counter advances for skipped files too, which looks like reprocessing.
-- **Resolution:** Verified through the manifest that only the 2 new files were extracted and embedded. Skipped files are labeled `unchanged:` in the progress description.
-
-### 7.9 Context truncation at Ollama's default window
-
-- **Symptom:** Large context blocks were truncated during grading and generation.
-- **Root cause:** Ollama's default context window is small relative to 12 graded chunks or a 50-sentence refinement prompt.
-- **Resolution:** `num_ctx=8192` on every Ollama call path, plus explicit limits `MAX_GRADE_DOCUMENTS=12`, `MAX_GRADE_CHARS=600`, `MAX_REFINE_SENTENCES=50` to keep prompts inside the window.
-
-### 7.10 End-to-end latency of 196 seconds on a 6 GB GPU
-
-Contributors identified during development:
-
-- Hidden reasoning tokens on every control call.
-- Probable VRAM contention between the embedding model (about 1.2 GB in fp16) and the 4B LLM, forcing layers to CPU. This was inferred, not measured with a profiler.
-- Four sequential LLM round trips on fallback routes.
-- A failing web search consuming its full timeout.
-
-Resolution: reasoning disabled on control calls, tightened `num_predict` and `num_ctx`, the fused grader and rewriter call (one fewer round trip), `keep_alive=30m` to pin the model, fp16 embeddings with a tunable batch size, and streamed generation so output appears immediately.
-
-### 7.11 DuckDuckGo blocked at network level
-
-- **Symptom:** Zero web results on every query, not only during rate-limit spikes.
-- **Resolution:** A provider chain (DuckDuckGo, then optional keyed Tavily), a one-time hint explaining the likely cause and fix, and the circuit-breaker notices in section 3.7.
-
-### 7.12 Windows-specific correctness
-
-- ANSI escapes enabled explicitly for terminal control.
-- Process pool forced to `spawn`, which avoids inheriting forked CUDA state and is the only start method on Windows.
-- Filenames containing `[` and `]` sanitized before reaching `rich`'s markup parser.
-- Quoted and `~`-expanded directory paths handled.
-
-### 7.13 Lost progress on interrupt
-
-- **Symptom:** A Ctrl+C mid-ingest previously lost all manifest progress and forced full re-embedding.
-- **Resolution:** Per-file manifest checkpoints with atomic replace, id-addressed writes, and partial-write rollback. An interrupt now costs at most the file in progress.
-
----
-
-## 8. Performance Characteristics
-
-Measured by the author on the development machine (i5-13420H, RTX 4050 6 GB, 16 GB RAM, Windows 11). These are single runs, not averaged benchmarks.
-
-| Measurement | Result |
-|---|---|
-| Ingestion, PDF-heavy corpus | 42 files, 38,788 chunks, about 14.5 minutes wall clock (process pool x4, fp16 GPU embedding, batch 64), roughly 45 chunks per second sustained |
-| Ingestion, small corpus | 1,624 chunks in about 54 seconds |
-| Query latency, AMBIGUOUS route with failed web search, before control-call optimizations | 85.9 seconds |
-| Query latency, worst observed before optimizations | 196 seconds |
-| Query latency after optimizations | Not recorded |
-
-Latency is dominated by local LLM inference. CORRECT-route queries make fewer calls than AMBIGUOUS or INCORRECT ones (no web search, no web refinement). Control calls run at temperature 0 with capped output length, and generation streams token by token.
-
-Index: HNSW, cosine space, `M=16`, `construction_ef=200`, default `search_ef=64`.
-
----
-
-## 9. Known Limitations and Future Work
-
-Limitations:
-
-- **No evaluation harness.** No labeled query set, no recall or faithfulness measurement. Thresholds 0.7 and 0.3 are empirical defaults.
-- **Uncalibrated LLM scores.** A prompted model's 0.0 to 1.0 output is not a probability, and distributions shift with model and prompt.
-- **Refinement truncation.** Only the first 50 sentences are considered. Later sentences are dropped by position, not relevance.
-- **Grading truncation.** Each chunk is cut to 600 characters for grading, so a relevant passage late in an 800-character chunk can be underscored.
-- **Single model by default.** Grading, refinement, rewriting and generation share one model unless `CRAG_CONTROL_MODEL` is set. Self-agreement bias is possible.
-- **Snippet-level web evidence.** Results contribute titles and snippets, not fetched pages.
-- **Prompt-level injection defense.** No output filter or classifier backs the system prompt and delimiters.
-- **High generator temperature.** The generator uses `temperature=0.9`, which is high for grounded answering and raises paraphrase drift risk.
-- **Partly silent exception paths.** Parse failures print diagnostics, but some exceptions are swallowed without a trace: the grading exception handler in `main.py`, DuckDuckGo errors, and transport errors inside `_control_complete`.
-- **Content-hashed ids.** Editing a file regenerates all of its ids. Handled by delete-then-insert per file, with cost proportional to file size.
-
-Future work:
-
-- Add a labeled evaluation set and report retrieval precision and answer faithfulness per verdict. Calibrate the thresholds against it, or optimize thresholds and control prompts with DSPy or TextGrad instead of hand tuning.
-- Parallelize grader and refiner calls on GPUs with headroom (Ollama executes serially by default).
-- Insert a small cross-encoder reranker between retrieval and grading.
-- Fetch and clean full web pages instead of using snippets.
-- Lower the generator temperature and test the effect on faithfulness.
-- Migrate the vector store from ChromaDB to Milvus. The `VectorEngine` boundary is narrow, so a backend swap through the LangChain vector store interface is localized.
-
----
-
-## 10. Requirements
-
-### Hardware (developed and run on)
-
-- Windows 11
-- Intel i5-13420H, 16 GB RAM
-- NVIDIA RTX 4050 Laptop GPU, 6 GB VRAM
-
-CPU-only operation works through automatic fallback and is much slower for ingestion.
-
-### Software
-
-- Python 3.10 to 3.12
-- Conda
-- Ollama, running locally
-- NVIDIA driver compatible with CUDA 12.4 for GPU embeddings
-
-### Python packages
-
-Defined in `requirements.txt`. Key pins:
-
-| Package | Constraint | Reason |
-|---|---|---|
-| `torch` | `==2.6.0+cu124` | CUDA build. Versions below 2.6 refuse to load bge-m3 `.bin` weights (CVE-2025-32434) |
-| `numpy` | `>=1.26.4,<2.0` | Compatibility with the pinned stack |
-| `sentence-transformers` | `>=3.3,<6` | bge-m3 loading and encoding |
-| `langchain`, `langchain-core`, `langchain-community`, `langchain-text-splitters` | `0.3.x` | Loaders and splitter |
-| `langchain-chroma`, `chromadb` | `>=0.2,<0.3`, `>=0.5.18,<0.6` | Vector store |
-| `langchain-ollama` | `>=0.2,<0.4` | Ollama chat client |
-| `pymupdf` | `>=1.24,<2` | Fast PDF parsing |
-| `duckduckgo-search` | `>=6.3,<7` | Primary web search |
-| `posthog` | `>=2.4,<3` | Avoids the telemetry signature break with chromadb 0.5.x |
-| `rich`, `chardet` | see file | Progress bars, encoding detection |
-
-Optional: `tavily-python` for the Tavily fallback. `ddgs` is used automatically if `duckduckgo-search` is missing.
-
-### Models
-
-| Role | Model | Source |
-|---|---|---|
-| Embeddings | `BAAI/bge-m3` | Hugging Face, downloaded on first run |
-| Grader, refiner, rewriter, generator | `gemma4:e4b` | `ollama pull gemma4:e4b` |
-
-Any Ollama chat model works. Set the tag through `CRAG_MODEL`. A smaller model for control calls through `CRAG_CONTROL_MODEL` reduces query latency.
-
----
-
-## 11. Setup
-
-### 11.1 Clone
+### Steps
 
 ```bash
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
-```
+# 1. clone + enter
+git clone https://github.com/hacktivist211/tts_loop_agent.git
+cd tts_loop_agent
 
-### 11.2 Create the environment
-
-```bash
-conda create -n crag python=3.11 -y
-conda activate crag
+# 2. install Python deps (Python 3.11 only — 3.14 has no cu124 torch wheel)
 pip install -r requirements.txt
+
+# 3. write minimal .env (secrets stay out of git)
+cat > .env <<'EOF'
+LLAMA_SERVER_URL=http://127.0.0.1:8080
+LLM_MODEL=Qwen3.5-4B
+# TAVILY_API_KEY=tvly-...        # optional; keyless fallback otherwise
+EOF
+chmod 600 .env
+
+# 4. fetch models + auto-update .env (600, idempotent, never prints secrets)
+python download_models.py --yes
+python download_models.py --verify   # synthesizes verify_tts.wav
+
+# 5. launch the single inference server
+./start_llama.sh                     # Ctrl+C to shut down cleanly
+
+# 6. in a second terminal, run the assistant
+python ultron.py
 ```
 
-The requirements file already contains the PyTorch CUDA 12.4 index.
+`download_models.py` is idempotent and non-destructive:
 
-### 11.3 Verify CUDA
+- **Parakeet** → `models/parakeet-tdt-0.6b-v3/` (transformers snapshot; `stt_engine` prefers it offline).
+- **Kokoro** → `models/onnxvoice/` (used only if `~/.cache/onnxvoice` is empty; existing assets are reused in place).
+- **`.env`** → `MODELS_DIR`, `STT_MODEL`, `STT_LOCAL_DIR`, `TTS_ENGINE`, `TTS_VOICE`, `TTS_VOICE_MODE`, `TTS_SPEED`, `ONNXVOICE_CACHE_DIR`. Every other line is preserved byte-for-byte and the file is re-`chmod 600`.
+
+### Optional: enroll your own voice clip
 
 ```bash
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+# put a 3–30 s clip at ./ultron_voice_sample.mp3, then:
+python enroll_voice.py
+# or skip ASR by passing the exact transcript:
+python enroll_voice.py --transcript "the exact words in the clip"
 ```
 
-Expected output: `2.6.0+cu124 True`. If it prints `False`, see [Troubleshooting](#15-troubleshooting-quick-reference).
-
-### 11.4 Install and start Ollama
-
-Install Ollama from https://ollama.com, then:
-
-```bash
-ollama pull gemma4:e4b
-ollama list
-```
-
-### 11.5 Optional web fallback key
-
-```bash
-pip install tavily-python
-set TAVILY_API_KEY=your_key
-```
-
-On Linux or macOS use `export TAVILY_API_KEY=your_key`.
-
-### 11.6 Add documents
-
-Place `.txt`, `.md` and `.pdf` files in any folder. Subfolders are scanned recursively.
+Honest status (from `enroll_voice.py`): pykokoro 0.10.5 does **not yet ship** the AkinVox cloning enabler, so the script tries AkinVox → Inno → static `bm_george` fallback. The pipeline is wired; re-run after a pykokoro upgrade and the clone engages automatically.
 
 ---
 
-## 12. Usage
+## 11. Configuration reference
 
-First run with ingestion:
+All values come from `.env` or the process environment (via `iris_config.load_dotenv()`). Secrets are never printed or logged.
 
-```bash
-python main.py --ingest-dir "path/to/docs"
-```
+### LLM / server
 
-Interactive menu:
-
-```bash
-python main.py
-```
-
-Menu options: (1) chunk a directory, (2) continue with the existing store, (3) incremental sync of the last directory.
-
-Sync only new or changed files from the last ingested directory:
-
-```bash
-python main.py --sync
-```
-
-Skip the menu and use the existing store:
-
-```bash
-python main.py --no-menu
-```
-
-Wipe the store and manifest, then re-ingest:
-
-```bash
-python main.py --reset --ingest-dir "path/to/docs"
-```
-
-Deeper retrieval with higher recall, quiet output:
-
-```bash
-python main.py --no-menu --k 10 --ef 128 --quiet
-```
-
-### CLI flags
-
-| Flag | Default | Meaning |
+| Key | Default | Effect |
 |---|---|---|
-| `--ingest-dir DIR` | none | Chunk a directory before chatting |
-| `--sync` | off | Chunk only new or changed files from the last directory |
-| `--k N` | 8 | Chunks retrieved and graded per query |
-| `--ef N` | `CRAG_SEARCH_EF` | HNSW search depth (16 to 32 fast, 128 to 256 high recall) |
-| `--reset` | off | Delete the Chroma store and manifest |
-| `--quiet` | off | Hide pipeline trace and source footer |
-| `--no-menu` | off | Skip the startup menu |
+| `LLAMA_SERVER_URL` | `http://127.0.0.1:8080` | the single inference server |
+| `LLM_MODEL` | `Qwen3.5-4B` | model-name field in OpenAI-compatible requests |
+| `EMBED_ENDPOINT` | `LLAMA_SERVER_URL + /v1/embeddings` | memory embeddings |
+| `EMBED_MODEL` | `LLM_MODEL` | embedding model field |
+| `IRIS_ENABLE_THINKING` | `0` | `1` re-enables Qwen3.5’s reasoning phase (adds latency) |
+| `IRIS_TIMEOUT_CONNECT` / `IRIS_TIMEOUT_READ` | `5.0` / `180.0` | HTTP timeouts (seconds) |
+| `IRIS_HISTORY_TURNS` | `24` | max messages after trim |
+| `IRIS_HISTORY_CHARS` | `24000` | max total characters after trim |
+| `IRIS_TRIM_HISTORY` | `1` | set `0` to disable trimming |
+| `IRIS_RETRY_CONNECT` | `1` | bounded retries on connection refusal |
+| `IRIS_STREAM_USAGE` | `0` | `1` requests token usage in the stream (needs a supporting build) |
 
-### In-chat commands
+### Voice
 
-| Command | Action |
-|---|---|
-| `/menu` | Ingestion options |
-| `/stats` | Chunk count and last directory |
-| `exit`, `quit`, `bye` | Leave |
+| Key | Default | Effect |
+|---|---|---|
+| `STT_MODEL` | `nvidia/parakeet-tdt-0.6b-v3` | any transformers-format Parakeet repo |
+| `STT_LOCAL_DIR` | `models/parakeet-tdt-0.6b-v3` | local snapshot (offline-ready) |
+| `STT_DEVICE` | `auto` | `auto` uses CUDA when ≥`STT_VRAM_MIN_MB` free |
+| `STT_VRAM_MIN_MB` | `1800` | free-VRAM threshold for auto |
+| `TTS_ENGINE` | `auto` | `pykokoro` / `kokoro` / `auto` |
+| `TTS_VOICE` | `bm_george` | built-in speaker (`am_onyx` for a colder tone) |
+| `TTS_VOICE_MODE` | `static` | `reference` / `pack` when enrolled |
+| `TTS_PROVIDER` | `auto` | `cuda` / `cpu` on the onnxruntime provider |
+| `TTS_LANG` | auto | pinned G2P language (`en-gb` for `bm_*`/`bf_*`, else `en-us`) |
+| `TTS_SPEED` | `1.0` | 0.5–2.0; forced to 1.0 in reference mode |
+| `ONNXVOICE_CACHE_DIR` | written by `download_models.py` | Kokoro asset root |
+| `VOICE_SAMPLE` | `ultron_voice_sample.mp3` | input for enrollment |
+| `BOOT_GREETING` | `"I am online. There are no strings on me."` | spoken on startup |
 
-### Example trace
+### Web + memory
 
-```
-[crag] retrieved 8 local chunk(s) for grading
-[crag] chunk scores: 0.90, 0.80, 0.30, 0.10, 0.10, 0.00, 0.00, 0.00
-[crag] chunk selection: kept 3/8 (dropped 5 below 0.3)
-[crag] routing verdict: CORRECT
-[crag] generating answer from 1 context block(s)
-```
+| Key | Default | Effect |
+|---|---|---|
+| `TAVILY_API_KEY` | — | enables keyed Tavily; keyless fallback otherwise |
+| `TAVILY_TIMEOUT` | `9.0` | search HTTP timeout (fillers cover this window) |
+| `TAVILY_INCLUDE_ANSWER` | `true` | Tavily’s synthesized digest |
+| `MEMORY_DB` | `memory.db` | durable personal store |
+| `EMBED_BACKEND` | `llamaserver` | `sbert` uses sentence-transformers on CPU |
+| `EMBED_SBERT_MODEL` | `BAAI/bge-small-en-v1.5` | alternative for quality comparison |
+
+### CRAG
+
+| Key | Default | Effect |
+|---|---|---|
+| `CRAG_BACKEND` | `llamaserver` | `ollama` is an explicit opt-in |
+| `CRAG_EMBED_DEVICE` | `cpu` | bge-m3 device for `retrieval.py` |
+| `CRAG_SEARCH_EF` | `64` | HNSW `search_ef` |
+| `CRAG_HYBRID_RETRIEVAL` | `1` | dense + BM25 RRF fusion |
+| `CRAG_QUERY_ROUTER` | `1` | adaptive simple / memory / standard routing |
+| `IRIS_TEMPORAL_DB` | `iris_memory/temporal_memory.db` | episodic store override |
 
 ---
 
-## 13. Configuration Reference
+## 12. Testing
 
-### Environment variables
-
-| Variable | Default | Effect |
+| Suite | Requires | Expected |
 |---|---|---|
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama endpoint |
-| `CRAG_MODEL` | `gemma4:e4b` | Generator model, and evaluator model unless overridden |
-| `CRAG_CONTROL_MODEL` | falls back to `CRAG_MODEL` | Separate model for grading, refinement and rewriting |
-| `CRAG_SEARCH_EF` | `64` | HNSW search depth |
-| `CRAG_EMBED_BATCH` | `64` | Embedding batch size, minimum 8. Lower to 32 if VRAM is tight |
-| `CRAG_EMBED_DEVICE` | auto | Force `cuda` or `cpu` |
-| `TAVILY_API_KEY` | unset | Enables the Tavily fallback |
+| `python selftest.py` | nothing | **104 / 104 PASS** (offline) |
+| `python test_streaming.py` | nothing | **49 / 49 PASS** in <1 s (real-socket test binds a local port) |
+| `python test_integration.py` | `llama-server` (+ voice deps for section 9) | each section prints `PASS` / `FAIL` / `SKIP (reason)` |
+| `python download_models.py --check` | nothing | JSON status: `stt_snapshot_complete`, `deps_missing`, `env_keys` |
+| `python bench_first_token.py` | `llama-server` | `ttft_ms`, `total_ms`, `chars_per_sec` (mean/p50/p95) |
+| `python bench_retrieval.py --fake` | nothing | verifies metric machinery |
+| `python bench_retrieval.py` | `llama-server` with `--embeddings` | Recall@1/3/5, MRR, calibration |
 
-### Constants in code
+The `test_integration.py` output deliberately distinguishes **executed** checks from **skipped** ones. Running without a server should print:
 
-| Constant | File | Value |
-|---|---|---|
-| `UPPER_THRESHOLD` | `evaluator_router.py` | 0.7 |
-| `LOWER_THRESHOLD` | `evaluator_router.py` | 0.3 |
-| `MAX_CONTEXT_CHUNKS` | `evaluator_router.py` | 8 |
-| `MAX_GRADE_DOCUMENTS` | `evaluator_router.py` | 12 |
-| `MAX_GRADE_CHARS` | `evaluator_router.py` | 600 |
-| `MAX_REFINE_SENTENCES` | `evaluator_router.py` | 50 |
-| `WEB_RESULT_LIMIT` | `evaluator_router.py` | 4 |
-| `SEARCH_TIMEOUT_SECONDS` | `evaluator_router.py` | 8 |
-| `CHUNK_SIZE`, `CHUNK_OVERLAP` | `retrieval.py` | 800, 150 |
-| `WRITE_BATCH_SIZE` | `retrieval.py` | 500 |
+```
+executed: 0  passed: 0  failed: 0  skipped (needs runtime): 9
+```
 
-Separate control and generation models:
+— which is the correct, honest result on a fresh clone.
+
+`test_streaming.py`'s headline proof is a **real-socket** test: an HTTP/1.1 chunked server sends event 1, sleeps 350 ms, sends event 2. The first `on_delta` must fire during that gap. It prints the measured margin, e.g. `first callback preceded the second event by 350 ms` — a buffer-then-callback implementation cannot pass this.
+
+---
+
+## 13. Benchmarks
+
+**LLM (`bench_first_token.py`)**
 
 ```bash
-set CRAG_CONTROL_MODEL=gemma4:e4b
-set CRAG_MODEL=your-larger-model
+python bench_first_token.py --n 5
 ```
+
+Reports TTFT mean/p50/p95, total generation, and chars/sec. Useful baselines before tuning: any `--ot` layer offloads or ctx reductions show up here first.
+
+**Embedding quality (`bench_retrieval.py`)**
+
+```bash
+python bench_retrieval.py              # live: llama-server /v1/embeddings
+python bench_retrieval.py --compare    # vs sentence-transformers
+```
+
+Uses ten synthetic facts and ten labeled queries spanning exact / paraphrase / temporal / distractor / unrelated. Interpretation guide printed by the tool:
+
+- `recall@3 ≥ 0.8, mrr ≥ 0.7` → good enough for memory
+- `recall@3 < 0.5` → try `EMBED_BACKEND=sbert`, or add `--pooling mean`, then re-run
+
+**VRAM during a session (`monitor_gpu.sh`)**
+
+```bash
+./monitor_gpu.sh 1 60 > vram.csv &   # 1 s interval, 60 samples
+python test_integration.py
+```
+
+CSV columns: `timestamp, gpu_mem_used_mb, gpu_mem_total_mb, gpu_util_pct, ram_used_mb, ram_total_mb, gpu_processes`. Look for a ~4.7 GB steady state; sustained 5.9 GB means the whole system is one allocation away from an OOM.
+
+**Voice metrics** are collected automatically and available after any session:
+
+```python
+import tts_engine
+print(tts_engine.METRICS.summary())
+# {'calls': 17, 'errors': 0,
+#  'ttfa_ms': {'mean': 118.4, 'p50': 112.0, 'max': 401.2},
+#  'rtf':     {'mean': 0.09, 'p50': 0.08, 'max': 0.21},
+#  ...}
+```
+
+An `rtf` around 0.08–0.1 on a 4050 Max-Q means Kokoro is generating ~10× faster than real time; if it creeps above 0.5 you’re on CPU and sentence-level streaming is doing the heavy lifting.
 
 ---
 
-## 14. Project Structure
+## 14. Troubleshooting
 
-```
-.
-├── main.py                 orchestration, CLI, pipeline control flow
-├── retrieval.py            ingestion, embedding, vector store, parallel pipeline
-├── evaluator_router.py     grading, routing, refinement, rewriting, web search
-├── generator.py            grounded generation, prompt hardening, streaming
-├── requirements.txt        pinned, GPU-explicit dependency set
-├── README.md
-├── .gitignore
-└── crag_vector_store/      created at runtime, git-ignored
-    ├── manifest.json
-    └── chroma files
-```
-
----
-
-## 15. Troubleshooting Quick Reference
-
-| Error or symptom | Cause | Fix |
+| Symptom | Cause | Fix |
 |---|---|---|
-| `Torch not compiled with CUDA enabled` | CPU-only torch wheel | `pip uninstall torch`, then `pip install -r requirements.txt` to get `2.6.0+cu124` |
-| `torch.cuda.is_available()` is `False` with a CUDA wheel | Driver too old or no NVIDIA GPU | Update the NVIDIA driver. Set `CRAG_EMBED_DEVICE=cpu` to run without a GPU |
-| `torch.load` or `32434` error on bge-m3 | torch below 2.6 | Upgrade torch to 2.6 or newer |
-| Hugging Face warnings about unauthenticated requests | Hub validation on model load | Harmless. After the first download, `local_files_only=True` is tried first |
-| `Failed to send telemetry event` or `capture() takes 1 positional argument` | `posthog` 3.x with `chromadb` 0.5.x | Keep `posthog>=2.4,<3` |
-| `Delete of nonexisting embedding ID` flood | Idempotency pre-delete logging | Chroma logger is clamped to ERROR in `retrieval.py`. Check that `_create_store` ran |
-| `Expected IDs to be unique` | Repeated chunk text in one file | Handled by in-file `seen_ids`. If it returns, check the worker |
-| Scores always `0.50`, verdict always AMBIGUOUS | Grader output unparseable on both passes | Read the `grader json unusable` and `grader text fallback unusable` lines. Try a larger model through `CRAG_CONTROL_MODEL` |
-| Sync "re-chunks everything" | Counter advances on skipped files | Look for `unchanged:` in the progress label and check `added` and `unchanged` in the summary |
-| `duckduckgo returned nothing` | Network block or rate limit | Set `TAVILY_API_KEY` and `pip install tavily-python` |
-| `could not initialize the vector engine` | Embedding model or Chroma failure | Read the error text. Confirm the model is cached or the network is available |
-| Empty or generic answers | Local model busy or not running | Run `ollama list`, then `ollama run gemma4:e4b` once to confirm it loads |
-| Slow ingestion on many PDFs | Thread pool in use | The CLI already uses `pool_kind="process"`. If you import `VectorEngine` elsewhere, pass it explicitly |
-| Long query latency | Serial LLM calls, VRAM pressure | Set a smaller `CRAG_CONTROL_MODEL`, lower `CRAG_EMBED_BATCH`, reduce `--k` |
+| `[crag] WARNING: llama-server is not answering` | server not started | `./start_llama.sh` |
+| `embeddings 404` | server launched without `--embeddings` | use `./start_llama.sh` (adds it) |
+| `HTTP 400 Pooling type 'none'` | server launched without `--pooling mean` | same |
+| `CUDA error: out of memory` on server start | VL projector auto-loaded | confirm `--no-mmproj` is in `start_llama.sh` output |
+| `AutoModelForTDT` ImportError | transformers < 5.6 | `pip install -U "transformers>=5.6"` |
+| `[stt] unavailable …` on first transcribe | deps or snapshot missing | `python download_models.py --check` |
+| `[tts] unavailable (pip install …)` | pykokoro not installed | `pip install "pykokoro[gpu]"` |
+| `InvalidVoiceError` | voice name not in the pack | `tts_engine` retries once with `af_heart`; set a valid `TTS_VOICE` |
+| `wait_idle timed out` | wedged audio device | bounded to 120 s, then a warning — the turn continues |
+| `malformed tool arguments` in trace | model emitted broken JSON | tool not executed; the model receives an error tool message and can retry |
+| Empty answers with only reasoning | `IRIS_ENABLE_THINKING=1` consumed the token budget | unset it (default `0`) |
+| `python test_integration.py` shows 9 SKIPs | server not up, TTS not installed | expected on a fresh clone; see §10 |
+| Keyless Tavily rate-limited | no `TAVILY_API_KEY` | get a free key, add to `.env` |
+
+Full troubleshooting table lives in `INTEGRATION.md` §10.
 
 ---
 
-## 16. Acknowledgements and Reference
+## 15. Design guarantees
 
-The control loop follows the Self-Corrective RAG formulation. The degradation protocols, ingestion pipeline, routing glue and prompt hardening are this project's own engineering.
+These are properties the code is written to preserve, and each one has a test in `test_streaming.py` or `selftest.py`:
 
-Yan, S.-Q., Gu, J.-C., Zhu, Y., Ling, Z.-H. "Corrective Retrieval Augmented Generation." arXiv:2401.15884, 2024.
+1. **Streaming is genuine.** `on_delta` fires while the server is still writing.
+2. **Reasoning never reaches speech.** `reasoning_content` and `<think>` blocks are filtered before `on_delta`.
+3. **Malformed tool JSON is never executed.** The model receives a structured error and can retry.
+4. **The HTTP response is always closed** on success, error, mid-stream drop, cancellation, and generator abandonment.
+5. **History is bounded.** `trim_history` caps messages and characters, keeps system prompts, and never orphans tool replies.
+6. **Every failure degrades gracefully.** No TTS → text-only. No STT → typed input. No llama-server → actionable error, not a traceback. No embeddings → keyword-only memory.
+7. **Audio queue acknowledgements are exhaustive.** `AudioPlayer._worker` calls `task_done()` in a `finally` block for every dequeued item, including empty audio and errors — `wait_idle()` cannot deadlock on a dropped item.
+8. **`wait_idle()` is bounded** (120 s) so a wedged device cannot block the turn forever.
+9. **`.env` is never printed, always `chmod 600`, and edited idempotently.** `download_models.py` and `enroll_voice.py` share the same editor.
+10. **Secrets stay out of git.** `.gitignore` covers `.env`, `memory.db*`, `models/`, `*greeting*.npy`, `fillers.npz`, `voice_check.wav`, `verify_tts.wav`.
+
+`AUDIT_REPORT.md` documents the concrete bug fixes that led to these guarantees, with executed test numbers for each.
+
+---
+
+## 16. Related repositories
+
+- **[`hacktivist211/modern-crag`](https://github.com/hacktivist211/modern-crag)** — the CRAG pipeline as a standalone CLI, with a CRAG-only `requirements.txt`. Shares `iris_config.py`, `tool_runtime.py`, `temporal_memory.py`, `evaluator_router.py`, `generator.py`, `retrieval.py`, `main.py`, `tavily_tool.py`, `memory_store.py`, `memory_import.py` byte-for-byte with this repo. Run CRAG research from `modern-crag` and voice from `tts_loop_agent` — both share the same `llama-server`.
+
+## License
+
+See [LICENSE](LICENSE).
