@@ -212,7 +212,7 @@ _PLAIN_MARKERS = re.compile(
     r"(?im)^\s*(?:user|you|human|me|neeraj)\s*[:>]\s*(.*)$"
 )
 _PLAIN_AI_MARKERS = re.compile(
-    r"(?im)^\s*(?:assistant|ai|chatgpt|claude|gemini|copilot|iris|jarvis)\s*[:>]\s*(.*)$"
+    r"(?im)^\s*(?:assistant|ai|chatgpt|claude|gemini|copilot|iris|ultron)\s*[:>]\s*(.*)$"
 )
 
 

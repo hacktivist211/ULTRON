@@ -234,12 +234,12 @@ def test_think_filter():
 
 # ------------------------------------------------------------------ 3. chat() over fakes
 TOOLCALL_EVENTS = [
-    {"choices": [{"delta": {"content": "One moment, sir."}}]},
+    {"choices": [{"delta": {"content": "Accessing the network."}}]},
     {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "web_search", "arguments": "{\"qu"}}]}}]},
     {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "ery\":\"latest python\"}"}}]}}]},
 ]
 FINAL_EVENTS = [
-    {"choices": [{"delta": {"content": "Python 3.13, sir."}}]},
+    {"choices": [{"delta": {"content": "Python 3.13, creator."}}]},
 ]
 
 
@@ -248,7 +248,7 @@ def test_chat_incremental_callbacks():
     transcript = sse(
         {"choices": [{"delta": {"content": "Hel"}}]},
         {"choices": [{"delta": {"content": "lo, "}}]},
-        {"choices": [{"delta": {"content": "sir."}}]},
+        {"choices": [{"delta": {"content": "creator."}}]},
     )
     resp = FakeStreamResponse([transcript])
     deltas: list[tuple[str, bool]] = []  # (text, stream_exhausted_at_callback)
@@ -258,8 +258,8 @@ def test_chat_incremental_callbacks():
 
     text, trace = tr.chat([{"role": "user", "content": "hi"}],
                           on_delta=on_delta, use_tools=False, _post=FakePost([resp]))
-    check("text assembled in order", text == "Hello, sir.", f"text={text!r}")
-    check("deltas match pieces", [d for d, _ in deltas] == ["Hel", "lo, ", "sir."])
+    check("text assembled in order", text == "Hello, creator.", f"text={text!r}")
+    check("deltas match pieces", [d for d, _ in deltas] == ["Hel", "lo, ", "creator."])
     check("FIRST callback fires before the response finishes",
           len(deltas) >= 1 and not deltas[0][1],
           "first on_delta ran after the HTTP body was fully consumed - streaming is fake")
@@ -309,7 +309,7 @@ def test_tool_roundtrip():
     check("merged arguments correct", calls and calls[0][1] == {"query": "latest python"},
           f"args={calls[0][1] if calls else None!r}")
     check("on_tool_start fired before execution", starts == ["web_search"])
-    check("continuation text returned", text == "Python 3.13, sir.", f"text={text!r}")
+    check("continuation text returned", text == "Python 3.13, creator.", f"text={text!r}")
     check("trace records the tool round", len(trace) == 1 and trace[0]["_tool"] == "web_search")
     # message threading: round 2 must contain the assistant tool_call + tool reply
     msgs2 = post.payloads[1]["messages"]
@@ -349,7 +349,7 @@ def test_malformed_tool_args_never_executed():
     tool_msg = post.payloads[1]["messages"][-1]
     check("model receives a malformed-args error message",
           tool_msg["role"] == "tool" and "malformed" in tool_msg["content"].lower())
-    check("conversation still completes", text == "Python 3.13, sir.")
+    check("conversation still completes", text == "Python 3.13, creator.")
 
 
 def test_midstream_failure():

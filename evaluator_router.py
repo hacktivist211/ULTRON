@@ -4,10 +4,10 @@ import re
 import time
 
 try:
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS
 except ImportError:
     try:
-        from ddgs import DDGS
+        from duckduckgo_search import DDGS
     except ImportError:
         DDGS = None
 
@@ -29,6 +29,11 @@ except ValueError:
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 EVALUATOR_MODEL = os.getenv("CRAG_CONTROL_MODEL") or os.getenv("CRAG_MODEL", "gemma4:e4b")
+
+# Mirror iris_config.LLM_ENABLE_THINKING for the standalone CRAG CLI.
+LLAMA_ENABLE_THINKING = os.getenv("IRIS_ENABLE_THINKING", "0").strip().lower() in (
+    "1", "true", "yes", "on"
+)
 
 # reasoning-block stripping for non-streaming responses (built from pieces
 # so the literal tag text never appears in the source)
@@ -292,6 +297,10 @@ def _control_complete_llamaserver(messages, num_predict):
         "max_tokens": int(num_predict),
         "stream": False,
     }
+    # Keep the control call from spending its token budget on a reasoning
+    # phase: grading/refine/rewrite need the JSON immediately.
+    if not LLAMA_ENABLE_THINKING:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
     try:
         response = requests.post(
             f"{LLAMA_SERVER_URL}/v1/chat/completions",

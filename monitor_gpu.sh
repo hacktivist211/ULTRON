@@ -6,7 +6,7 @@
 #   ./monitor_gpu.sh 1 60 > vram.csv   # 1 s interval, 60 samples, CSV
 #
 # Useful while running bench_first_token.py or a real voice conversation:
-# it shows whether CosyVoice + llama-server + embeddings actually fit in
+# it shows whether Kokoro TTS + llama-server + embeddings actually fit in
 # the 6 GB budget, or whether something is swapping/evicting.
 #
 # Output columns (CSV):

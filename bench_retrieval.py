@@ -44,7 +44,7 @@ FACTS = [
     ("editor", "My favorite python editor is a plain terminal with vim.", 0.6),
     ("coffee", "I take my coffee black with one sugar.", 0.7),
     ("wifi", "My wifi password is helloworld42.", 0.8),
-    ("alarm", "My alarm tone is the jarvis alarm sound.", 0.6),
+    ("alarm", "My alarm tone is the ultron alarm sound.", 0.6),
     ("birthday", "My birthday is March 3rd.", 0.8),
     ("city", "I live in Kyoto near the central station.", 0.7),
     ("trip", "I am planning a trip to Hokkaido in winter.", 0.5),
@@ -79,7 +79,7 @@ def fake_embedder(store):
     concepts = ["gpu", "vram", "graphics", "coffee", "sugar", "wifi", "password",
                 "birthday", "march", "kyoto", "city", "station", "ramen",
                 "editor", "vim", "terminal", "llama", "qwen", "server", "alarm",
-                "jarvis", "trip", "hokkaido", "travel", "winter", "sound",
+                "ultron", "trip", "hokkaido", "travel", "winter", "sound",
                 "morning", "wake", "laptop", "port"]
 
     def embed(texts):

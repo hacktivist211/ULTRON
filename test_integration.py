@@ -35,7 +35,7 @@ RESULTS = []
 
 def record(name, status, detail=""):
     RESULTS.append((name, status, detail))
-    tag = {"PASS": "[PASS]", "FAIL": "[FAIL]", "SKIP": "[SKIP]"}[status]
+    tag = {"PASS": "[PASS]", "FAIL": "[FAIL]", "SKIP": "[SKIP]"}.get(status, f"[{status}]")
     print(f"  {tag} {name}" + (f"  ({detail})" if detail and status != "PASS" else ""))
     if status == "PASS" and detail:
         print(f"         {detail}")
@@ -131,7 +131,8 @@ def test_streaming(server_up):
     record("multiple incremental deltas", "PASS" if len(texts) >= 2 else "FAIL",
            f"{len(texts)} text events")
     record("time-to-first-token measured", "PASS" if ttft else "FAIL",
-           f"ttft {ttft:.0f} ms, total {total:.0f} ms")
+           f"ttft {ttft:.0f} ms, total {total:.0f} ms" if ttft
+           else f"no visible token, total {total:.0f} ms")
 
 
 def test_tool_roundtrip(server_up, do_web):
@@ -297,37 +298,30 @@ def test_crag_backend(server_up):
 
 
 def test_voice(do_voice):
-    print("\n== 9. voice synthesis (real TTS) ==")
+    print("\n== 9. voice synthesis (Kokoro-82M, real TTS) ==")
     if not do_voice:
         record("voice synthesis", "SKIP", "disabled with --no-voice")
         return
-    try:
-        import torch  # noqa: F401
-    except ImportError:
-        record("voice synthesis", "SKIP", "requires torch + GPU (runs on your machine)")
-        return
+    import tts_engine
     import voice_cache
 
-    profile = voice_cache.load_profile()
-    if profile is None:
+    tts = tts_engine.get_tts()
+    if tts is None or not tts.engine:
         record("voice synthesis", "SKIP",
-               "voice_profile.npz missing - run enroll_voice.py first")
+               "no TTS engine importable - pip install 'pykokoro[gpu]' (or kokoro)")
         return
-    cv, fp16 = voice_cache.get_cosyvoice()
-    if cv is None:
-        record("voice synthesis", "SKIP", "CosyVoice model unavailable (see stderr)")
-        return
-    cache = voice_cache.install_frontend_cache(cv, profile)
-    n = 0
-    for chunk in voice_cache.timed_inference(cv, "Systems online and verified, sir.", profile):
-        n += 1
+    audio, sr = voice_cache.timed_synthesis("I am online. There are no strings on me.")
     m = voice_cache.METRICS.summary()
-    record("synthesis produced chunks", "PASS" if n > 0 else "FAIL", f"{n} chunks")
+    record("synthesis produced audio", "PASS" if len(audio) > 0 else "FAIL",
+           f"{len(audio) / sr:.1f} s @ {sr} Hz, engine={tts.engine}")
     record("latency metrics captured", "PASS" if m["calls"] >= 1 else "FAIL",
            f"ttfa={m['ttfa_ms']}, rtf={m['rtf']}")
-    warm = voice_cache.warm(cv, profile, cache)
-    record("warm-up / boot greeting renders", "PASS" if warm is not None else "FAIL",
+    warm = voice_cache.warm()
+    record("warm-up / boot greeting", "PASS" if warm is not None else "FAIL",
            f"{len(warm) if warm is not None else 0} samples")
+    filler = voice_cache.get_filler(0)
+    record("filler cache serves instantly",
+           "PASS" if filler is not None and len(filler[0]) else "FAIL")
 
 
 def main() -> int:

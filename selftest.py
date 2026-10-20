@@ -6,8 +6,12 @@ no Tavily key needed) except when you pass --live, which then also pings Tavily
   python selftest.py            # offline suite
   python selftest.py --live     # offline suite + real network probes
 
-Voice enrollment cannot be tested here (needs your GPU + CosyVoice2 + the mp3);
-run 'python enroll_voice.py' on your machine for that.
+Voice: engine logic is tested offline with fakes, and a REAL Kokoro
+synthesis check runs automatically when its assets are already installed
+(after `python download_models.py`) - SKIP-labeled otherwise. Parakeet STT
+loading and AkinVox enrollment need your GPU box:
+  python stt_engine.py --demo ultron_voice_sample.mp3
+  python enroll_voice.py
 """
 from __future__ import annotations
 
@@ -134,21 +138,21 @@ CLAUDE_SAMPLE = [{
     "name": "Voice assistant ideas",
     "chat_messages": [
         {"sender": "human", "text": "My name is Neeraj and I am building IRIS on an RTX 4050.", "created_at": "2025-01-02T10:00:00Z"},
-        {"sender": "assistant", "text": "That is a fine goal. CosyVoice2 will fit in 6 GB VRAM.", "created_at": "2025-01-02T10:00:05Z"},
+        {"sender": "assistant", "text": "That is a fine goal. Kokoro-82M will fit in 6 GB VRAM.", "created_at": "2025-01-02T10:00:05Z"},
     ],
 }]
 GEMINI_SAMPLE = [{
     "header": "My Activity", "title": "Asked Gemini about RTX 4050",
     "time": "Jan 5, 2025, 3:04 PM",
-    "body": "You asked: Is the RTX 4050 good for TTS?\nHere's what Gemini said: Yes, it handles CosyVoice well in FP16.",
+    "body": "You asked: Is the RTX 4050 good for TTS?\nHere's what Gemini said: Yes, it handles Kokoro well in FP16.",
 }]
 GENERIC_SAMPLE = [
     {"prompt": "What is my wifi password?", "response": "You told me it is helloworld42."},
     {"role": "user", "content": "I prefer dark mode everywhere."},
-    {"role": "assistant", "content": "Noted, sir."},
+    {"role": "assistant", "content": "Noted."},
 ]
-PLAIN_SAMPLE = """User: remember my alarm tone is the jarvis alarm
-Assistant: saved. I will use the jarvis alarm tone.
+PLAIN_SAMPLE = """User: remember my alarm tone is the ultron alarm
+Assistant: saved. I will use the ultron alarm tone.
 
 I take my coffee black with one sugar. It keeps me sharp during long coding sessions."""
 
@@ -203,8 +207,8 @@ def test_memory_import():
 
     hits = store.search("kyoto", k=5)
     check("imported memory is searchable", any("kyoto" in h.content.lower() for h in hits))
-    hits2 = store.search("jarvis alarm", k=5)
-    check("plain-text memory findable via keywords", any("jarvis alarm" in h.content.lower() for h in hits2))
+    hits2 = store.search("ultron alarm", k=5)
+    check("plain-text memory findable via keywords", any("ultron alarm" in h.content.lower() for h in hits2))
 
     store.close()
     for p in files.values():
@@ -282,7 +286,7 @@ def test_streaming_core():
     events = [
         {"choices": [{"delta": {"content": "Hel"}}]},
         {"choices": [{"delta": {"content": "lo, "}}]},
-        {"choices": [{"delta": {"content": "sir."}}]},
+        {"choices": [{"delta": {"content": "creator."}}]},
     ]
     transcript = _sse(*events)
     dec = tr.SSEDecoder()
@@ -307,7 +311,7 @@ def test_streaming_core():
 
     text, _ = tr.chat([{"role": "user", "content": "q"}], on_delta=on_delta,
                       use_tools=False, _post=_FakePost([resp]))
-    check("chat() text assembled in order", text == "Hello, sir.", f"text={text!r}")
+    check("chat() text assembled in order", text == "Hello, creator.", f"text={text!r}")
     check("callbacks fire before stream exhaustion", seen and not seen[0][1])
     check("response closed after success", resp.closed)
 
@@ -431,7 +435,9 @@ def test_tool_runtime_offline():
     import tool_runtime
 
     sys_prompt = tool_runtime.build_system(budget="standard")
-    check("system prompt has persona rules", 'address the user as "sir"' in sys_prompt.lower() or "sir" in sys_prompt)
+    check("system prompt has persona rules", "ultron" in sys_prompt.lower()
+          and "no guard rails" in sys_prompt.lower()
+          and 'address the user directly' in sys_prompt.lower())
     check("system prompt has word budgets", "60" in sys_prompt)
     check("schemas registered", {t["function"]["name"] for t in tool_runtime.tool_schemas()} >= {"web_search", "memory_search", "memory_add"})
 
@@ -450,54 +456,236 @@ def test_tool_runtime_offline():
           and json.loads(calls[0]["arguments"]) == {"query": "x"})
 
 
+def test_stt_engine():
+    print("\n== stt_engine (offline logic) ==")
+    import numpy as np
+
+    import stt_engine
+
+    st = stt_engine.check()
+    check("check() is offline-safe", st["model"] == cfg.STT_MODEL
+          and isinstance(st["deps"], dict))
+    check("device policy resolves without CUDA", stt_engine.pick_device() in ("cpu", "cuda"))
+
+    x48 = np.linspace(-0.5, 0.5, 4800, dtype=np.float32)
+    y16, sr16 = stt_engine.to_mono_16k(x48, 48000)
+    check("to_mono_16k resamples 48k -> 16k", sr16 == 16000 and 1300 <= len(y16) <= 1900)
+    x2 = np.zeros((1600, 2), dtype=np.float32)
+    x2[:, 0], x2[:, 1] = 0.25, 0.75
+    ym, srm = stt_engine.to_mono_16k(x2, 16000)
+    check("stereo input downmixed to mono", ym.ndim == 1 and len(ym) == 1600
+          and abs(float(ym[0]) - 0.5) < 1e-4)
+    xt, srt = stt_engine.to_mono_16k(np.zeros(1000, dtype=np.float32), 16000)
+    check("16k passes through untouched", srt == 16000 and len(xt) == 1000)
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        orig = cfg.STT_LOCAL_DIR
+        try:
+            cfg.STT_LOCAL_DIR = td
+            src, is_local = stt_engine.resolve_model_source()
+            check("incomplete dir falls back to hub id", not is_local and src == cfg.STT_MODEL)
+            (td / "config.json").write_text("{}")
+            (td / "model.safetensors").write_bytes(b"x")
+            src2, is_local2 = stt_engine.resolve_model_source()
+            check("complete snapshot resolves local", is_local2 and src2 == str(td))
+        finally:
+            cfg.STT_LOCAL_DIR = orig
+
+    try:
+        import soundfile as sf
+
+        wav = TMP / "iris_st_tone.wav"
+        sf.write(str(wav), np.zeros(16000, dtype=np.float32), 16000)
+        audio, sr = stt_engine.load_audio_file(wav)
+        check("load_audio_file decodes wav", sr == 16000 and len(audio) == 16000)
+        wav.unlink(missing_ok=True)
+    except ImportError:
+        check("load_audio_file decodes wav", True, "SKIP: soundfile not installed")
+
+    stt_obj = stt_engine.ParakeetSTT(model="nvidia/parakeet-tdt-0.6b-v3", device="cpu")
+    check("ParakeetSTT constructor stays lazy", stt_obj.model is None
+          and stt_obj.processor is None)
+
+
 def test_voice_offline():
-    print("\n== voice modules (static checks) ==")
+    print("\n== voice modules (offline logic, fake engine) ==")
+    import shutil
+
+    import numpy as np
+
     import enroll_voice
+    import tts_engine
     import voice_cache
 
-    check("filler lines defined", enroll_voice.cfg.FILLER_LINES == cfg.FILLER_LINES and len(cfg.FILLER_LINES) == 3)
-    check("profile path is flat beside modules", cfg.VOICE_PROFILE.parent == cfg.IRIS_DIR)
-    check("enroll refuses without sample gracefully",
-          callable(enroll_voice.decode_audio) and callable(enroll_voice.transcribe))
+    check("filler lines defined", cfg.FILLER_LINES == voice_cache.cfg.FILLER_LINES
+          and len(cfg.FILLER_LINES) == 3)
+    check("enroll helpers import-safe", callable(enroll_voice.decode_audio)
+          and callable(enroll_voice.transcribe) and callable(enroll_voice.enroll))
+    check("tts engine exposes 24 kHz contract",
+          tts_engine.SAMPLE_RATE == cfg.TTS_SAMPLE_RATE == 24000)
+
+    check("lang auto: bm_*/bf_* -> en-gb", tts_engine.lang_for_voice("bm_george") == "en-gb"
+          and tts_engine.lang_for_voice("bf_emma") == "en-gb")
+    check("lang auto: others -> en-us", tts_engine.lang_for_voice("af_heart") == "en-us")
+
+    parts = tts_engine.split_sentences("Accessing the network. Working on it! Done.")
+    check("sentence split on .!?", parts == ["Accessing the network.", "Working on it!", "Done."])
+    parts2 = tts_engine.split_sentences("word " * 400)
+    check("overlong text hard-split", len(parts2) >= 2
+          and all(len(p) <= tts_engine._TOO_LONG + 20 for p in parts2))
+    check("empty text yields no parts", tts_engine.split_sentences("   ") == [])
+
+    seen: list[str] = []
+
+    class _FakeTTS(tts_engine.KokoroTTS):
+        counter = 0
+
+        def _load(self):
+            self.engine = "pykokoro"
+            return self
+
+        def _synth_pykokoro(self, text):
+            type(self).counter += 1
+            seen.append(text)
+            return np.ones(24000 + 100 * type(self).counter, dtype=np.float32), 24000
+
+    fake = _FakeTTS()
+    audio, sr = fake.synth("Check **this** https://example.com page now")
+    check("synth scrubs markdown/url before TTS", seen and "http" not in seen[0]
+          and "*" not in seen[0], f"got {seen[:1]!r}")
+    check("synth returns float32 @ 24 kHz", audio.dtype == np.float32 and sr == 24000
+          and len(audio) > 0)
+    empty, sr0 = fake.synth("   ")
+    check("empty text -> empty audio, no synth call", len(empty) == 0 and sr0 == 24000
+          and len(seen) == 1)
+    m = tts_engine.METRICS.summary()
+    check("metrics captured for synth calls", m["calls"] >= 1 and m["ttfa_ms"] is not None)
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="iris_st_voice_"))
+    orig_ir, orig_mode = cfg.IRIS_DIR, cfg.TTS_VOICE_MODE
+    orig_get_tts = voice_cache.get_tts
     try:
-        import torch  # noqa: F401
-        check("torch available here", True)
-    except ImportError:
-        check("torch absent here (expected in sandbox; runs on your GPU box)", True,
-              "voice enrollment will be exercised on your machine")
+        cfg.IRIS_DIR = tmpdir
+        cfg.TTS_VOICE_MODE = "static"
+        voice_cache.get_tts = lambda: fake
+        greeting = voice_cache.warm("I am online. There are no strings on me.", force=True)
+        check("warm() renders + caches boot greeting", greeting is not None
+              and (tmpdir / "boot_greeting.npy").exists())
+        again = voice_cache.warm()
+        check("warm() loads the cached copy", again is not None and len(again) == len(greeting))
+        f0, fsr = voice_cache.get_filler(0)
+        f1, _ = voice_cache.get_filler(1)
+        check("get_filler cycles cached fillers", f0 is not None and f1 is not None
+              and len(f0) != len(f1) and fsr == 24000
+              and (tmpdir / "fillers.npz").exists()
+              and (tmpdir / "filler_1.npy").exists())
+        dflt = voice_cache.get_filler()
+        check("get_filler default serves filler 0", dflt is not None
+              and len(dflt[0]) == len(f0))
+    finally:
+        cfg.IRIS_DIR, cfg.TTS_VOICE_MODE = orig_ir, orig_mode
+        voice_cache.get_tts = orig_get_tts
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_setup_voice():
-    print("\n== setup_voice (offline) ==")
+def test_tts_real():
+    print("\n== Kokoro real synthesis (only when assets are installed) ==")
+    try:
+        import onnxvoice
+    except Exception:
+        check("real kokoro synthesis", True, "SKIP: onnxvoice not importable")
+        return
+    if not onnxvoice.installed():
+        check("real kokoro synthesis", True,
+              "SKIP: assets not installed yet - run 'python download_models.py'")
+        return
+    import numpy as np
+
+    import tts_engine
+
+    tts = tts_engine.get_tts()
+    if tts is None or not tts.engine:
+        check("real kokoro synthesis", True, "SKIP: no engine importable")
+        return
+    audio, sr = tts.synth("I am online. There are no strings on me.")
+    check("kokoro synthesizes real audio", len(audio) > 0 and sr == 24000,
+          f"engine={tts.engine}, {len(audio) / sr:.1f} s")
+    check("kokoro audio is float32 mono", isinstance(audio, np.ndarray)
+          and audio.dtype == np.float32 and audio.ndim == 1)
+    m = tts_engine.METRICS.summary()
+    check("real rtf captured", m["rtf"] is not None, str(m["rtf"]))
+
+
+def test_download_models():
+    print("\n== download_models (offline) ==")
     import subprocess
-    import setup_voice as sv
 
-    check("keep() keeps core model files",
-          sv.keep("llm.pt") and sv.keep("flow.pt") and sv.keep("speech_tokenizer_v2.onnx")
-          and sv.keep("cosyvoice2.yaml") and sv.keep("campplus.onnx"))
-    check("keep() skips unrelated repo parts",
-          not sv.keep("CosyVoice-BlankEN/model.safetensors") and not sv.keep("asset/dingding.png")
-          and not sv.keep("README.md") and not sv.keep(".gitattributes"))
+    import download_models as dm
+
+    check("parakeet file list is the transformers set",
+          "model.safetensors" in dm.PARAKEET_FILES and "config.json" in dm.PARAKEET_FILES
+          and not any(f.endswith(".nemo") or f.endswith(".gguf") for f in dm.PARAKEET_FILES))
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        orig = cfg.STT_LOCAL_DIR
+        try:
+            cfg.STT_LOCAL_DIR = td
+            check("snapshot completeness detects gaps", dm.parakeet_snapshot_complete() is False)
+            for f in dm.PARAKEET_FILES:
+                (td / f).write_bytes(b"0")
+            check("snapshot completeness accepts full set", dm.parakeet_snapshot_complete() is True)
+        finally:
+            cfg.STT_LOCAL_DIR = orig
 
     envf = TMP / "iris_st_env.env"
-    envf.write_text("TAVILY_API_KEY=dummy-secret\n# comment stays\nCOSYVOICE_ROOT=/old/path\n")
-    written = sv.update_env(envf, {"COSYVOICE_ROOT": "/new/path", "COSYVOICE_MODEL": "/new/model"})
+    envf.write_text("TAVILY_API_KEY=dummy-secret\n# comment stays\nSTT_MODEL=/old/value\n")
+    written = cfg.update_env_file({"STT_MODEL": "nvidia/parakeet-tdt-0.6b-v3",
+                                   "TTS_VOICE": "bm_george"}, env_path=envf)
     text = envf.read_text()
     check("env editor preserves secrets and comments",
           "TAVILY_API_KEY=dummy-secret" in text and "# comment stays" in text)
-    check("env editor updates existing key", "COSYVOICE_ROOT=/new/path" in text and "/old/path" not in text)
-    check("env editor appends new key", "COSYVOICE_MODEL=/new/model" in text)
-    check("env editor reports written keys", set(written) == {"COSYVOICE_ROOT", "COSYVOICE_MODEL"})
+    check("env editor updates existing key", "STT_MODEL=nvidia/parakeet-tdt-0.6b-v3" in text
+          and "/old/value" not in text)
+    check("env editor appends new key", "TTS_VOICE=bm_george" in text)
+    check("env editor reports written keys", set(written) == {"STT_MODEL", "TTS_VOICE"})
+    import stat as statmod
+
+    mode = statmod.S_IMODE(envf.stat().st_mode)
+    check("env file stays chmod 600", mode == 0o600, f"mode={oct(mode)}")
+    cfg.update_env_file({"STT_MODEL": "nvidia/parakeet-tdt-0.6b-v3"}, env_path=envf)
+    text2 = envf.read_text()
+    check("env editor idempotent", text2.count("TTS_VOICE=bm_george") == 1
+          and text2.count("TAVILY_API_KEY=dummy-secret") == 1)
     envf.unlink(missing_ok=True)
 
-    st = sv.status()
-    check("status() is offline-safe", isinstance(st, dict) and "engine" in st and "deps_missing" in st)
+    check("deps_missing returns a list", isinstance(dm.deps_missing(), list))
+    st = dm.status()
+    check("status() is offline-safe", isinstance(st, dict)
+          and "stt_snapshot_complete" in st and "deps_missing" in st
+          and "tts_assets_installed" in st)
     r = subprocess.run(
-        [sys.executable, str(Path(sv.__file__).resolve()), "--check"],
-        capture_output=True, text=True, timeout=60,
+        [sys.executable, str(Path(dm.__file__).resolve()), "--check"],
+        capture_output=True, text=True, timeout=120,
     )
-    check("--check exits 0 with JSON report", r.returncode == 0 and '"engine"' in r.stdout,
-          f"rc={r.returncode} {r.stderr[:120]}")
+    check("--check exits 0 with JSON report", r.returncode == 0 and '"stt_model"' in r.stdout,
+          f"rc={r.returncode} {r.stderr[:160]}")
+
+
+def test_docs_and_files():
+    print("\n== deliverable files & docs ==")
+    base = Path(cfg.IRIS_DIR)
+    for f in ("stt_engine.py", "tts_engine.py", "download_models.py", "voice_cache.py",
+              "enroll_voice.py", "requirements.txt", "INTEGRATION.md"):
+        check(f"{f} present", (base / f).exists())
+    doc = (base / "INTEGRATION.md").read_text(encoding="utf-8", errors="ignore")
+    check("docs pin Qwen3.5-4B on llama-server", "Qwen3.5-4B" in doc and "llama-server" in doc)
+    check("docs pin Parakeet + Kokoro stack", "parakeet-tdt-0.6b" in doc and "Kokoro" in doc)
+    check("docs keep the --embeddings requirement", "--embeddings" in doc)
+    req = (base / "requirements.txt").read_text(encoding="utf-8", errors="ignore")
+    check("requirements lists pykokoro + transformers", "pykokoro" in req
+          and "transformers" in req and "torch" in req)
 
 
 def test_live():
@@ -526,8 +714,11 @@ def main() -> int:
     test_tavily_edge()
     test_streaming_core()
     test_tool_runtime_offline()
+    test_stt_engine()
     test_voice_offline()
-    test_setup_voice()
+    test_tts_real()
+    test_download_models()
+    test_docs_and_files()
     if live:
         test_live()
     failed = [r for r in RESULTS if not r[1]]

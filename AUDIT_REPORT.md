@@ -9,7 +9,7 @@ Test suites executed here (real numbers, reproduced by re-running):
 
 | suite | result | what it proves |
 |---|---|---|
-| `python selftest.py` | **67/67 PASS** | offline correctness of config, memory, imports, tavily shapes, streaming core, setup_voice |
+| `python selftest.py` | **67/67 PASS** | offline correctness of config, memory, imports, tavily shapes, streaming core, Kokoro voice |
 | `python test_streaming.py` | **49/49 PASS** (0.7 s) | Critical Issue 1 — incl. split-at-every-byte SSE parsing, UTF-8 splits, think-tag filter, tool-fragment merge, malformed-args rejection, resource closure, and a **real-socket test where the first callback fires 350 ms before the server writes its second event** |
 | `python scripts/crag_smoke.py` (fake llama-server) | **37/37 PASS** | CRAG llama-server backend: grade/refine/rewrite parse, streamed generation, reasoning filtering, dead-backend degradation, legacy DB migration, zero Ollama/langchain/torch imports |
 | `python scripts/run_integration_fake.py` | **22/22 executed PASS, 1 SKIP** | full integration plumbing over real HTTP against a scripted OpenAI-compatible server: health, models, embeddings dimension checks, streaming, tool-call→memory_add→continuation, memory write/restart/recall, imported recall, multi-turn, CRAG control plane. Voice = SKIP (needs your GPU) |
@@ -39,7 +39,7 @@ risk), M=medium (correctness edge), L=low (hygiene).
 | 6 | Two unrelated databases both named `memory.db` (personal vs episodic) + CWD-relative risk | H | `temporal_memory.py` — `iris_memory/memory.db`; `memory_store.py` — `memory.db` | organic growth, no store map | episodic store renamed `iris_memory/temporal_memory.db` with **non-destructive auto-migration** (legacy copied, original kept); `IRIS_TEMPORAL_DB` override; memory map documented in `iris_config.py` and INTEGRATION.md | migration + reopen + lifecycle checks (crag_smoke) | **VERIFIED** |
 | 7 | Embedding quality assumed, never measured; dimension mismatches unguarded | H | `memory_store.py` — no validation; self-tests used a fake embedder | OpenAI-compatible endpoint ≠ useful embeddings | `bench_retrieval.py` (labeled queries: exact/paraphrase/date/distractor/unrelated; Recall@1/3/5 + MRR + calibration score); optional `EMBED_BACKEND=sbert` comparison; dimension guard: first embed fixes dim, mismatches raise (embed) or skip-with-warning (stored vectors) | `--fake` metric machinery executed; real quality REQUIRES RUNTIME (`python bench_retrieval.py`) | machinery **VERIFIED**; quality numbers pending your run |
 | 8 | Web-search grounding was prompt-thin; empty results could be hallucinated over | H | `tavily_tool.py` + `tool_runtime` prompt | no evidence contract | bounded evidence payload (title/url/snippet preserved), `empty` flag + explicit guidance ("could not verify" instead of guessing), SEARCH GROUNDING system-prompt section, `answer` labeled as search-engine synthesis not a source | tavily edge tests + payload bound checks (selftest 67/67) | **VERIFIED** (offline shapes); live grounding judgement REQUIRES RUNTIME |
-| 9 | Voice pipeline: duplicate model loads possible, no latency metrics, hard failures | H | `voice_cache.py` | no lifecycle owner | `get_cosyvoice()` singleton (reuses `enroll_voice.load_cosyvoice`, version-tolerant), returns `None` on failure → text-only degradation; `timed_inference()` + `VoiceMetrics` (TTFA, synth ms, audio s, RTF); empty-input guard in `cached_inference` | static compile + interface checks (no torch here) | REQUIRES RUNTIME (voice section of `test_integration.py`) |
+| 9 | Voice pipeline: duplicate model loads possible, no latency metrics, hard failures | H | `voice_cache.py` | no lifecycle owner | `get_tts()` singleton (Kokoro-82M via pykokoro, official `kokoro` fallback, version-tolerant), returns `None` on failure → text-only degradation; `timed_synthesis()` + `VoiceMetrics` (TTFA, synth ms, audio s, RTF); empty-input guard in `synth()` | static compile + interface checks (no torch here) | REQUIRES RUNTIME (voice section of `test_integration.py`) |
 | 10 | Conversation history unbounded | H | `tool_runtime.chat()` — caller-managed only | no policy | `trim_history()`: keep leading system messages + newest messages within `IRIS_HISTORY_TURNS` (24) / `IRIS_HISTORY_CHARS` (24000); tool messages never orphaned from their assistant owner | trim tests incl. orphan case | **VERIFIED** |
 | 11 | `start_llama.sh` was fire-and-forget: no health wait, no error reporting, no clean shutdown | H | `start_llama.sh` | minimal script | pre-flight (binary, port, free VRAM, `--embeddings` support probe), bounded `/health` wait with READY + endpoints, early-exit diagnostics, `trap` for INT/TERM, env tunables; server command itself stays byte-identical to yours (+`--embeddings`) | `bash -n` + logic review; live behavior REQUIRES RUNTIME | static **VERIFIED**; live REQUIRES RUNTIME |
 | 12 | Connect failures gave raw tracebacks; no retry policy | M | `tool_runtime.chat()` | no wrapper | `LlamaServerError` with actionable messages ("Is ./start_llama.sh running?"), one bounded connection retry, mid-stream failure returns partial text + honest trace entry, empty response raises | empty-stream and mid-stream failure tests | **VERIFIED** |
@@ -55,14 +55,14 @@ outstanding beyond the REQUIRES RUNTIME items above.
 
 ```
             ┌────────────────────────────────────────────────┐
-            │  llama.cpp llama-server  (Qwen3.5-4B Q8_0)     │
+            │  llama.cpp llama-server  (Qwen3.5-4B Ablit.)   │
             │  ./start_llama.sh  --jinja --embeddings        │
             │  127.0.0.1:8080   (the ONLY model in VRAM)     │
             └───────┬──────────────────┬─────────────────────┘
         SSE stream │                  │ non-stream + SSE
    ┌───────────────┴──────┐    ┌───────┴──────────────────────┐
    │ PRIMARY voice runtime│    │ CRAG research CLI            │
-   │ jarvis.py (yours) +  │    │ main.py → evaluator_router   │
+   │ ultron.py (yours) +  │    │ main.py → evaluator_router   │
    │ tool_runtime.chat()  │    │   (grade/refine/rewrite,     │
    │  on_delta → chunker  │    │    temp 0, same server)      │
    │  on_tool_start →     │    │ generator.py (streamed)      │
@@ -74,11 +74,11 @@ outstanding beyond the REQUIRES RUNTIME items above.
   Tavily    memory.db  (durable personal memory, embeddings via
   (HTTP)    the same llama-server /v1/embeddings)
        │
-  Voice: setup_voice.py → enroll_voice.py (once) → voice_cache.py
-  (profile npz + frontend memoization + CosyVoice2 singleton + metrics)
+  Voice: enroll_voice.py (once) → voice_cache.py
+  (cached greeting/fillers + Kokoro singleton + metrics)
 ```
 
-- **Primary entry point**: `jarvis.py` (your orchestrator; it was not among
+- **Primary entry point**: `ultron.py` (your orchestrator; it was not among
   the supplied files and was not invented) calls `tool_runtime.chat()`.
   `python tool_runtime.py --demo` exercises the same path standalone.
 - **Single inference runtime**: llama-server. CRAG is a client, not a stack:
@@ -95,8 +95,8 @@ outstanding beyond the REQUIRES RUNTIME items above.
 - **Voice ↔ streaming**: text deltas feed the sentence chunker while
   generation continues; fillers mask tool latency; reasoning is filtered
   before TTS; voice failure degrades to text.
-- **Resource policy**: llama-server owns the GPU; TTS (CosyVoice2, ~fp16)
-  is the only co-resident GPU consumer and is lazy-loaded as a singleton;
+- **Resource policy**: llama-server owns the GPU; TTS (Kokoro-82M ONNX,
+  ~0.4 GB) is the co-resident consumer and is lazy-loaded as a singleton;
   CRAG embeddings run on CPU; CRAG control calls are short temperature-0
   requests on the same server (sequential with voice turns under
   `--parallel 1`).
@@ -141,7 +141,7 @@ all 50 prior checks retained), `INTEGRATION.md`, `README.md`.
   CRAG smoke 37/37, integration-fake 22/22 (1 skip), retrieval-bench
   machinery, plus compile/lint of every file.
 - Not executable here (no GPU/server): real llama-server TTFT and tok/s,
-  real embedding Recall/MRR, real tool roundtrips with Qwen, real CosyVoice
+  real embedding Recall/MRR, real tool roundtrips with Qwen, real Kokoro
   synthesis, GPU/VRAM measurements. Commands: `python test_integration.py`,
   `python bench_retrieval.py`, `python bench_first_token.py`,
   `./monitor_gpu.sh 1 60`.

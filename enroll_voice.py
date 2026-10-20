@@ -1,34 +1,33 @@
 #!/usr/bin/env python3
-"""ONE-TIME voice enrollment for IRIS (CosyVoice2 zero-shot cloning).
+"""ONE-TIME voice enrollment for IRIS (Kokoro-82M stack).
 
-Answers the key question: does the assistant re-learn the sample audio on
-every startup?  NO. Enrollment runs once, extracts everything CosyVoice2
-needs from your 15 second JARVIS sample, and saves it as a single fingerprint
-file (voice_profile.npz). Every later startup just loads that fingerprint
-(milliseconds) and never touches the mp3, ffmpeg, or Whisper again.
+Straight answer to "can it learn my 15 s Ultron clip?":
+- Parakeet (STT) is a recognition model - it cannot mimic a voice.
+- Kokoro-82M built-in voices (bm_george default) are fixed speakers.
+- pykokoro ships an enrollment API with two engines:
+    AkinVox  transcript-conditioned reference cloning -> ultron_reference.npz
+    Inno     zero-shot voice tuning (no transcript)   -> ultron_pack.npz
+  As of pykokoro 0.10.5 those enablers are not yet distributed
+  ('en-akinvox-cloning-v1' has no runtime-ready distribution; the v1.0
+  model does not advertise the inno-v0.2 enabler). This script TRIES them in
+  order and falls back to the closest built-in voice when they are absent -
+  so the clone engages automatically the day you upgrade pykokoro and
+  re-run this script.
 
-What enrollment does, exactly once:
-  1. decode jarvis_alarm_15s031ms.mp3 to clean 16 kHz mono (ffmpeg fallback)
-  2. transcribe it (faster-whisper or whisper; or pass --transcript yourself)
-  3. run the CosyVoice2 frontend on it ONCE and cache the speaker embedding,
-     acoustic speech tokens, and spectral features
-  4. pre-render your three fillers AND the boot greeting in the cloned voice,
-     so dead-air masking audio matches your JARVIS timbre exactly
-  5. render a voice check line and measure speaker similarity (cosine)
+What runs exactly once (never again at startup):
+  1. decode ultron_voice_sample.mp3 to mono float32 (soundfile/ffmpeg)
+  2. transcribe it ONCE with Parakeet (stt_engine) - or pass --transcript
+  3. AkinVox / Inno / static-fallback enrollment
+  4. pre-render the three fillers + the boot greeting in the chosen voice
+  5. write voice_check.wav (audition) + update .env (TTS_VOICE_MODE, TTS_VOICE)
 
-Artifacts created (all flat, beside this file):
-  voice_profile.npz    the learned voice fingerprint (prompt text + wav + tensors)
-  filler_1.npy ...     pre-rendered fillers, float32 24 kHz (drop-in for your player)
-  fillers.npz          same fillers in one file, with texts
-  boot_greeting.npy    spoken greeting for instant startup playback
-  voice_check.wav      audition clip so you can hear the clone yourself
-  voice_prompt_16k.wav decoded wav cache of the mp3 (reusable, optional)
+Startup after enrollment only ever loads npz files and plays cached audio.
 
 Usage:
   python enroll_voice.py
-  python enroll_voice.py --force
-  python enroll_voice.py --transcript "exact words spoken in the sample"
-  python enroll_voice.py --cpu                # if the GPU is busy
+  python enroll_voice.py --transcript "the exact words spoken in the clip"
+  python enroll_voice.py --force                 # re-enroll
+  python enroll_voice.py --voice bm_lewis        # pick a different built-in
 """
 from __future__ import annotations
 
@@ -40,150 +39,117 @@ from pathlib import Path
 
 import iris_config as cfg
 
-ARTIFACT_METHODS = ("_extract_spk_embedding", "_extract_speech_token", "_extract_speech_feat")
+CHECK_LINE = "Voice check complete. There are no strings on me."
 
 
-# ------------------------------------------------------------------ audio decode
-def decode_audio(path: Path, sr: int = 16000):
-    """Return torch tensor (1, T) float32 mono at sr. ffmpeg fallback for mp3."""
-    import torch
-    import torchaudio
-
-    wav_cache = cfg.IRIS_DIR / "voice_prompt_16k.wav"
+# ------------------------------------------------------------------ decode
+def decode_audio(path: Path):
+    """-> (np.float32 mono, sample_rate). soundfile first, ffmpeg fallback."""
     try:
-        wav, got = torchaudio.load(str(path))
-        if got != sr:
-            wav = torchaudio.functional.resample(wav, orig_freq=got, new_freq=sr)
-    except Exception:
-        import subprocess
+        import soundfile as sf
 
-        if not wav_cache.exists():
-            subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path),
-                 "-ac", "1", "-ar", str(sr), str(wav_cache)],
-                check=True,
-            )
-        wav, got = torchaudio.load(str(wav_cache))
-        if got != sr:
-            wav = torchaudio.functional.resample(wav, orig_freq=got, new_freq=sr)
-    if wav.shape[0] > 1:
-        wav = wav.mean(dim=0, keepdim=True)
-    wav = wav.clamp(-1.0, 1.0)
-    try:  # light peak normalization
-        peak = wav.abs().max()
-        if 0.1 < peak < 0.98:
-            wav = wav / peak * 0.95
+        audio, sr = sf.read(str(path), dtype="float32")
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+        import numpy as np
+
+        return np.asarray(audio, dtype=np.float32), sr
     except Exception:
         pass
-    return wav.float()
+    import subprocess
+
+    tmp = cfg.IRIS_DIR / "voice_prompt_decoded.wav"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path), "-ac", "1", str(tmp)],
+        check=True,
+    )
+    import soundfile as sf
+
+    audio, sr = sf.read(str(tmp), dtype="float32")
+    return audio, sr
 
 
-# ------------------------------------------------------------------ transcription
-def transcribe(path: Path, wav) -> str:
-    """Transcribe the voice sample once. Returns the prompt transcript."""
+# ------------------------------------------------------------------ transcript
+def transcribe(path: Path) -> str:
+    """One-time transcript: Parakeet first (it is the resident STT), then the
+    legacy faster-whisper fallback. Returns '' when nothing worked."""
+    try:
+        import stt_engine
+
+        stt = stt_engine.get_stt()
+        if stt is not None:
+            out = stt.transcribe_file(str(path))
+            text = out.get("text", "").strip()
+            if len(text) >= 3:
+                print(f"[enroll] parakeet transcript ({out.get('rtf')}x RTF, "
+                      f"{out.get('decode_s')} s): {text!r}")
+                return text
+    except Exception as e:
+        print(f"[enroll] parakeet transcription failed ({type(e).__name__}: {e})")
     try:
         from faster_whisper import WhisperModel
 
-        device = "cuda" if _cuda() else "cpu"
-        model = WhisperModel("base.en", device=device, compute_type="int8" if device == "cuda" else "int8")
+        model = WhisperModel("base.en", device="cpu", compute_type="int8")
         segments, _ = model.transcribe(str(path), language="en", beam_size=1, vad_filter=True)
-        text = " ".join(s.text.strip() for s in segments).strip()
-        if text:
-            return text
-    except ImportError:
-        print("[enroll] faster-whisper not installed, trying openai-whisper")
-    except Exception as e:
-        print(f"[enroll] faster-whisper failed ({type(e).__name__}: {e}); trying openai-whisper")
-    try:
-        import whisper
-
-        model = whisper.load_model("base.en", device="cuda" if _cuda() else "cpu")
-        text = model.transcribe(str(path), language="en")["text"].strip()
-        if text:
-            return text
-    except ImportError:
-        pass
-    except Exception as e:
-        print(f"[enroll] whisper failed ({type(e).__name__}: {e})")
-    return ""
-
-
-def _cuda() -> bool:
-    try:
-        import torch
-
-        return torch.cuda.is_available()
+        return " ".join(s.text.strip() for s in segments).strip()
     except Exception:
-        return False
+        return ""
 
 
-# ------------------------------------------------------------------ cosyvoice loading
-def load_cosyvoice(cpu: bool = False):
-    """Import and load CosyVoice2 from the detected checkout. Robust to versions."""
-    import sys as _sys
+# ------------------------------------------------------------------ enrollment
+def enroll(reference_wav: Path, transcript: str):
+    """AkinVox -> Inno -> None. Returns (voice_object_or_None, mode)."""
+    from pykokoro import GenerationConfig, KokoroSynthesizer, SynthesisConfig
 
-    root = cfg.find_cosyvoice_root()
-    if root is None:
-        raise RuntimeError(
-            "CosyVoice checkout not found. Run 'python setup_voice.py' once: it clones "
-            "the engine, downloads CosyVoice2-0.5B, and writes COSYVOICE_ROOT / "
-            "COSYVOICE_MODEL into .env automatically."
-        )
-    if str(root) not in _sys.path:
-        _sys.path.insert(0, str(root))
-    model_dir = cfg.find_cosyvoice_model()
-    if model_dir is None:
-        raise RuntimeError(
-            "CosyVoice2 model files not found. Run 'python setup_voice.py' once: it "
-            "downloads CosyVoice2-0.5B (about 3.9 GB) and updates .env automatically."
-        )
-    fp16 = cfg.COSYVOICE_FP16 and not cpu
-    from cosyvoice.cli.cosyvoice import CosyVoice2, CosyVoice  # type: ignore
-
-    for ctor, kwargs in ((CosyVoice2, {"fp16": fp16, "cpu": cpu}), (CosyVoice, {"fp16": fp16, "cpu": cpu})):
-        try:
-            return ctor(str(model_dir), **kwargs), fp16
-        except TypeError:
+    syn = KokoroSynthesizer(SynthesisConfig(
+        generation=GenerationConfig(speed=1.0, lang="en-us"),
+    ))
+    try:
+        if transcript:
             try:
-                return ctor(str(model_dir)), fp16
-            except TypeError:
-                continue
-    raise RuntimeError("could not construct a CosyVoice model (unexpected signature)")
-
-
-# ------------------------------------------------------------------ rendering
-def synth(cv, text: str, prompt_text: str, wav16k, stream: bool = False):
-    """Render text in the cloned voice. Returns torch tensor (1, T) at 24 kHz."""
-    import torch
-
-    chunks = []
-    for out in cv.inference_zero_shot(text, prompt_text, wav16k, stream=stream):
-        chunks.append(out["tts_speech"])
-    if not chunks:
-        raise RuntimeError("CosyVoice produced no audio")
-    return torch.cat(chunks, dim=1)
-
-
-def save_npy(path: Path, tensor) -> None:
-    """Save a float32 24 kHz mono numpy array for the instant-playback pipeline."""
-    import numpy as np
-
-    np.save(str(path), tensor.squeeze(0).float().numpy().astype(np.float32))
+                ref = syn.enroll_voice(str(reference_wav), transcript,
+                                       engine="akinvox", language="en-us", name="ultron")
+                ref.save(str(cfg.TTS_REFERENCE_VOICE))
+                print(f"[enroll] AkinVox reference voice saved -> {cfg.TTS_REFERENCE_VOICE.name}")
+                return ref, "reference"
+            except Exception as e:
+                print(f"[enroll] AkinVox unavailable ({type(e).__name__}: {e})")
+                print("        the pykokoro runtime has not shipped the cloning enabler yet;")
+                print("        the pipeline is wired for it - re-run after upgrading pykokoro.")
+        else:
+            print("[enroll] no transcript: skipping AkinVox (it needs the exact words)")
+        try:
+            pack = syn.enroll_voice(str(reference_wav), engine="inno",
+                                    language="en", name="ultron-inno")
+            pack.save(str(cfg.TTS_VOICE_PACK))
+            print(f"[enroll] Inno voice pack saved -> {cfg.TTS_VOICE_PACK.name}")
+            return pack, "pack"
+        except Exception as e:
+            print(f"[enroll] Inno unavailable ({type(e).__name__}: {e})")
+    finally:
+        try:
+            syn.close()
+        except Exception:
+            pass
+    return None, "static"
 
 
 # ------------------------------------------------------------------ main
 def main() -> int:
-    ap = argparse.ArgumentParser(description="One-time IRIS voice enrollment")
-    ap.add_argument("--force", action="store_true", help="re-enroll even if a profile exists")
-    ap.add_argument("--transcript", default="", help="manual transcript of the sample (bypass ASR)")
-    ap.add_argument("--cpu", action="store_true", help="run enrollment on CPU")
-    ap.add_argument("--greeting", default=cfg.BOOT_GREETING, help="boot greeting line to pre-render")
-    ap.add_argument("--skip-fillers", action="store_true", help="do not (re)render filler npy files")
+    ap = argparse.ArgumentParser(description="One-time IRIS voice enrollment (Kokoro stack)")
+    ap.add_argument("--force", action="store_true", help="re-enroll even if a voice exists")
+    ap.add_argument("--transcript", default="", help="exact words spoken in the clip (bypasses ASR)")
+    ap.add_argument("--voice", default="", help="built-in voice for static fallback (default bm_george)")
+    ap.add_argument("--prefer", choices=["akinvox", "inno"], default="akinvox",
+                    help="enrollment engine preference")
+    ap.add_argument("--greeting", default=cfg.BOOT_GREETING, help="boot line to pre-render")
+    ap.add_argument("--skip-fillers", action="store_true", help="do not (re)render filler caches")
     args = ap.parse_args()
 
-    if cfg.VOICE_PROFILE.exists() and not args.force:
-        print(f"voice profile already exists: {cfg.VOICE_PROFILE}")
-        print("startup will load this fingerprint directly (no mp3 decode, no ASR, no re-learning).")
+    already = cfg.TTS_REFERENCE_VOICE.exists() or cfg.TTS_VOICE_PACK.exists()
+    if already and not args.force:
+        print("an enrolled voice already exists (ultron_reference.npz / ultron_pack.npz).")
+        print("startup loads it directly - nothing is re-decoded or re-transcribed.")
         print("use --force to re-enroll.")
         return 0
 
@@ -196,122 +162,108 @@ def main() -> int:
 
     # 1) decode
     print(f"[1/5] decoding {cfg.VOICE_SAMPLE.name} ...")
-    wav16k = decode_audio(cfg.VOICE_SAMPLE)
-    dur = wav16k.shape[-1] / 16000.0
-    print(f"      {dur:.1f} s of 16 kHz audio")
-    if dur < 5 or dur > 30:
-        print("      WARNING: CosyVoice zero-shot works best with 5-30 s of clean speech")
+    audio, sr = decode_audio(cfg.VOICE_SAMPLE)
+    dur = len(audio) / sr
+    print(f"      {dur:.1f} s of {sr / 1000:.0f} kHz mono audio")
+    if dur < 3 or dur > 30:
+        print("      WARNING: enrollment works best with 3-30 s of clean single-speaker audio")
 
-    # 2) transcript
-    print("[2/5] transcribing sample (one time only) ...")
-    prompt_text = args.transcript.strip() or transcribe(cfg.VOICE_SAMPLE, wav16k)
-    if len(prompt_text) < 3:
-        print("ERROR: could not get a transcript (>= 3 chars required by CosyVoice).")
-        print("Run again with:  python enroll_voice.py --transcript \"words spoken in the clip\"")
-        return 1
-    print(f"      transcript: {prompt_text}")
-
-    # 3) load CosyVoice and extract the fingerprint
-    print("[3/5] loading CosyVoice2 and extracting the voice fingerprint ...")
-    artifacts, fp16_used = {}, False
+    # persist a decoded wav (pykokoro reads files; also reusable)
+    ref_wav = cfg.IRIS_DIR / "voice_prompt_24k.wav"
     try:
-        cv, fp16_used = load_cosyvoice(args.cpu)
-        front = cv.frontend
-        for name in ARTIFACT_METHODS:
-            fn = getattr(front, name, None)
-            if not callable(fn):
-                continue
-            try:
-                out = fn(wav16k)
-                artifacts[name] = {k: v.detach().cpu().numpy() for k, v in dict(out).items()}
-                print(f"      cached {name} -> {list(artifacts[name])}")
-            except Exception as e:
-                print(f"      (skipped {name}: {type(e).__name__})")
+        import soundfile as sf
+
+        sf.write(str(ref_wav), audio, sr)
+        print(f"      decoded cache: {ref_wav.name}")
     except Exception as e:
-        print(f"      CosyVoice unavailable ({e}).")
-        print("      Saving a PARTIAL profile (wav + transcript). Zero-shot will still work,")
-        print("      but fillers cannot be pre-rendered now. Re-run enroll later with the")
-        print("      CosyVoice repo available for the full fingerprint.")
-        _save_partial(prompt_text, wav16k)
-        return 0
+        print(f"      wav cache skipped ({type(e).__name__})")
 
-    # 4) save the profile
-    import numpy as np
-    import torch
+    # 2) transcript (needed by AkinVox, skipped by Inno)
+    print("[2/5] transcribing the sample (one time only) ...")
+    transcript = args.transcript.strip() or transcribe(cfg.VOICE_SAMPLE)
+    if transcript:
+        print(f"      transcript: {transcript}")
+    else:
+        print("      no transcript available (AkinVox will be skipped)")
 
-    flat = {"prompt_text": np.array(prompt_text), "wav16k": wav16k.numpy().astype(np.float16)}
-    for m, d in artifacts.items():
-        for k, v in d.items():
-            flat[f"art__{m}__{k}"] = v
-    flat["meta"] = np.array(
-        json.dumps(
-            {
-                "sample": cfg.VOICE_SAMPLE.name,
-                "duration_s": round(dur, 2),
-                "fp16": fp16_used,
-                "created": time.time(),
-                "transcript": prompt_text,
-            }
-        )
-    )
-    np.savez_compressed(str(cfg.VOICE_PROFILE), **flat)
-    print(f"      saved {cfg.VOICE_PROFILE.name} ({cfg.VOICE_PROFILE.stat().st_size / 1e6:.1f} MB)")
+    # 3) enrollment ladder
+    print(f"[3/5] enrollment (prefer {args.prefer}) ...")
+    try:
+        _voice_obj, mode = enroll(ref_wav, transcript) if args.prefer == "akinvox" else (None, "static")
+        if args.prefer == "inno":
+            _voice_obj, mode = enroll_inno_only(ref_wav)
+    except ImportError:
+        print("      pykokoro is not installed - static built-in voice it is.")
+        print('      install with:  pip install "pykokoro[gpu]"')
+        mode = "static"
+    if mode == "static":
+        if args.voice:
+            cfg.TTS_VOICE = args.voice.strip()
+        print(f"      static voice selected: {cfg.TTS_VOICE} "
+              "(built-in; closest match to the Ultron timbre)")
 
-    # 5) pre-render fillers + greeting in the cloned voice, then verify
-    print("[4/5] pre-rendering fillers and boot greeting in YOUR cloned voice ...")
+    # 4) .env + config sync BEFORE any synthesis so prerender uses the new mode
+    written = cfg.update_env_file({
+        "TTS_VOICE_MODE": mode,
+        "TTS_VOICE": cfg.TTS_VOICE,
+        **({"TTS_SPEED": "1.0"} if mode == "reference" else {}),
+    })
+    cfg.TTS_VOICE_MODE = mode  # module attr for this process
+    print(f"[4/5] .env updated: {', '.join(written)} (other lines preserved)")
+
+    # 5) pre-render fillers + greeting + audition clip in the selected voice
     if not args.skip_fillers:
+        print(f"[5/5] pre-rendering fillers and boot greeting in the {mode} voice ...")
+        import voice_cache
+
+        greeting = voice_cache.warm(args.greeting, force=True)
+        if greeting is None:
+            print("      pre-render FAILED (TTS unavailable) - startup will retry")
+        else:
+            print(f"      boot_greeting.npy ({len(greeting) / cfg.TTS_SAMPLE_RATE:.1f} s), "
+                  "fillers.npz, filler_1..3.npy written")
         try:
-            for i, line in enumerate(cfg.FILLER_LINES, 1):
-                audio = synth(cv, line, prompt_text, wav16k)
-                save_npy(cfg.IRIS_DIR / f"filler_{i}.npy", audio)
-                print(f"      filler_{i}.npy  <- {line!r}")
-            np.savez_compressed(
-                str(cfg.IRIS_DIR / "fillers.npz"),
-                texts=np.array(json.dumps(cfg.FILLER_LINES)),
-                **{f"f{i}": np.load(str(cfg.IRIS_DIR / f"filler_{i}.npy")) for i in range(1, len(cfg.FILLER_LINES) + 1)},
-            )
-            boot = synth(cv, args.greeting, prompt_text, wav16k)
-            save_npy(cfg.IRIS_DIR / "boot_greeting.npy", boot)
-            import torchaudio
+            import soundfile as sf
 
-            torchaudio.save(str(cfg.IRIS_DIR / "voice_check.wav"), boot, cfg.TTS_SAMPLE_RATE)
+            import tts_engine
+
+            tts = tts_engine.get_tts()
+            if tts is not None:
+                check_audio, check_sr = tts.synth(CHECK_LINE)
+                if len(check_audio):
+                    sf.write(str(cfg.IRIS_DIR / "voice_check.wav"), check_audio, check_sr)
+                    print("      voice_check.wav written - listen to audition the voice")
         except Exception as e:
-            print(f"      filler pre-render failed ({type(e).__name__}: {e}); continuing")
+            print(f"      voice check skipped ({type(e).__name__}: {e})")
 
-    print("[5/5] verifying the clone ...")
-    try:
-        import torchaudio
-
-        check = synth(cv, "Voice check complete, sir. All systems nominal.", prompt_text, wav16k)
-        torchaudio.save(str(cfg.IRIS_DIR / "voice_check.wav"), check, cfg.TTS_SAMPLE_RATE)
-        if "_extract_spk_embedding" in artifacts:
-            import torch.nn.functional as F
-
-            check16 = torchaudio.functional.resample(check, cfg.TTS_SAMPLE_RATE, 16000)
-            ref = front._extract_spk_embedding(wav16k)["flow_spk_embedding"]
-            new = front._extract_spk_embedding(check16)["flow_spk_embedding"]
-            cos = float(F.cosine_similarity(ref, new, dim=-1))
-            print(f"      speaker similarity (cosine): {cos:.3f}  (>= 0.6 is a solid clone)")
-            print("      listen to voice_check.wav to audition the voice yourself")
-    except Exception as e:
-        print(f"      verification skipped ({type(e).__name__}: {e})")
-
-    print(f"\nenrollment finished in {time.time() - t0:.1f} s.")
-    print("From now on, startup only does: np.load(voice_profile.npz). The mp3, ffmpeg,")
-    print("whisper, and speaker extraction are NEVER run again unless you pass --force.")
+    print(f"\nenrollment finished in {time.time() - t0:.1f} s (mode: {mode}).")
+    if mode == "static":
+        print("Honest status: the clip was NOT cloned - pykokoro's cloning enabler is not")
+        print("distributed yet. bm_george is the closest built-in voice. Re-run this script")
+        print("after a pykokoro upgrade; the reference-voice path is already wired.")
+    else:
+        print("From now on, startup only loads the npz + cached audio - the mp3, ffmpeg,")
+        print("and Parakeet transcription are never touched again (unless --force).")
     return 0
 
 
-def _save_partial(prompt_text: str, wav16k) -> None:
-    import numpy as np
+def enroll_inno_only(ref_wav: Path):
+    from pykokoro import GenerationConfig, KokoroSynthesizer, SynthesisConfig
 
-    np.savez_compressed(
-        str(cfg.VOICE_PROFILE),
-        prompt_text=np.array(prompt_text),
-        wav16k=wav16k.numpy().astype(np.float16),
-        meta=np.array(json.dumps({"partial": True})),
-    )
-    print(f"      saved partial profile {cfg.VOICE_PROFILE}")
+    syn = KokoroSynthesizer(SynthesisConfig(generation=GenerationConfig(speed=1.0, lang="en-us")))
+    try:
+        pack = syn.enroll_voice(str(ref_wav), engine="inno", language="en", name="ultron-inno")
+        pack.save(str(cfg.TTS_VOICE_PACK))
+        print(f"[enroll] Inno voice pack saved -> {cfg.TTS_VOICE_PACK.name}")
+        return pack, "pack"
+    except Exception as e:
+        print(f"[enroll] Inno unavailable ({type(e).__name__}: {e})")
+        return None, "static"
+    finally:
+        try:
+            syn.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

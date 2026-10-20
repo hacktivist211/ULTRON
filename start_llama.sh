@@ -1,13 +1,50 @@
 #!/usr/bin/env bash
 # IRIS llama-server launcher - Qwen3.5-4B via llama.cpp (never Ollama).
 #
-# This is YOUR exact working command with exactly ONE flag added:
+# This is YOUR exact working command with the flags below added:
 #   --embeddings   -> serves /v1/embeddings so memory_store.py can embed
 #                     memories through the same model (cheap: your
 #                     --n-gpu-layers all setup already keeps it resident).
+#   --pooling mean -> the model's default pooling is 'none', which llama.cpp
+#                     rejects for the OpenAI-compatible /v1/embeddings route
+#                     ("Pooling type 'none' is not OAI compatible"). 'mean'
+#                     makes that endpoint work; it does not affect generation.
+#   --reasoning off -> server-side default: Qwen3.5's thinking phase stays OFF
+#                     for every request, so replies start speaking immediately
+#                     instead of after hundreds of hidden reasoning tokens.
+#                     (Request-level chat_template_kwargs in tool_runtime.py /
+#                     evaluator_router.py are a second, independent belt.)
 #
-# Everything else is byte-for-byte your command. The model itself stays in
-# llama.cpp's -hf cache (~/.cache/llama.cpp) - nothing is re-downloaded.
+#   --no-mmproj  -> do NOT load the vision/CLIP projector. IRIS never sends
+#                     images to the LLM (no image_url payloads anywhere; the
+#                     --vision OCR flag in main.py is never read), but Qwen3.5
+#                     is a VL model, so llama.cpp otherwise auto-loads a
+#                     644 MiB projector AND warms it up with a dummy 1472x1472
+#                     image. Total cost: ~900 MiB of VRAM out of 6 GB.
+#                     Without this the server sits at ~104 MiB free and dies
+#                     with "CUDA error: out of memory" in
+#                     ggml_cuda_graph_evaluate_and_capture / cudaGraphInstantiate
+#                     as soon as a new graph shape appears (measured: ~120 MiB
+#                     more is needed as shapes accumulate). With it: ~1 GB free.
+#                     Re-enable only if you start sending images to the model.
+#
+# Everything else is byte-for-byte your command. Weights come from the
+# Hugging Face cache model downloaded by `-hf`; on a first run with a repo or
+# quant you have never pulled, llama.cpp fetches it once (~2.5 GB for Q4_K_M)
+# and then reuses it.
+#
+# Weights: mradermacher/Qwen3.5-4B_Abliterated-GGUF Q4_K_M (2.52 GiB).
+# The abliterated (refusal-ablated) finetune of Qwen3.5-4B, same architecture,
+# same chat template and same tool-calling markers, so --jinja tools,
+# --reasoning off and --embeddings all behave exactly as before.
+# Q4_K_M instead of the old Q8_0 drops resident VRAM from ~4.26 GiB to
+# ~2.5 GiB, which is the main reason the 6 GB card now fits STT on CUDA as
+# well (STT needs >= 1800 MiB free). The old unsloth Q8/Q4 cache was deleted.
+#   --cache-type-k/v q8_0 below are the KV-CACHE types and are unchanged.
+#
+# This repo also ships mmproj-*.gguf files (it is a VL model too), so
+# --no-mmproj below matters here: it prevents llama.cpp from downloading and
+# loading a ~650 MB vision projector that IRIS never uses.
 #
 # What this wrapper adds around the server itself:
 #   - pre-flight: binary exists, port not already serving, ~free VRAM shown
@@ -16,22 +53,24 @@
 #   - tunables via environment variables (defaults = your values):
 #       IRIS_LLAMA_BIN  path to llama-server     (~/llama.cpp/build/bin/llama-server)
 #       IRIS_LLAMA_DIR  llama.cpp checkout       (~/llama.cpp)
-#       IRIS_MODEL      -hf model repo            (unsloth/Qwen3.5-4B-GGUF:Q8_0)
+#       IRIS_MODEL      -hf model repo            (mradermacher/Qwen3.5-4B_Abliterated-GGUF:Q4_K_M)
 #       IRIS_PORT       listen port               (8080)
 #       IRIS_HOST       bind address              (127.0.0.1)
 #       IRIS_CTX        context size              (16384)
 #       IRIS_WAIT_S     health-wait timeout       (120)
 #
 # Memory tool calls need --jinja (you already have it).
-# If VRAM ever gets tight with CosyVoice running beside it, try adding:
+# If VRAM ever gets tight with the STT/TTS models beside it, try adding:
 #   --ot per_layer_token_embd.weight=CPU
-# (offloads the token embedding layer to RAM, ~300 MB freed).
+# (offloads the token embedding layer to RAM, ~300 MB freed), or set
+# STT_DEVICE=cpu / TTS_PROVIDER=cpu in .env - Kokoro on CPU is real-time fast
+# and Parakeet tolerates CPU fine for short utterances.
 
 set -u
 
 LLAMA_DIR="${IRIS_LLAMA_DIR:-$HOME/llama.cpp}"
 LLAMA_BIN="${IRIS_LLAMA_BIN:-$LLAMA_DIR/build/bin/llama-server}"
-MODEL="${IRIS_MODEL:-unsloth/Qwen3.5-4B-GGUF:Q8_0}"
+MODEL="${IRIS_MODEL:-mradermacher/Qwen3.5-4B_Abliterated-GGUF:Q4_K_M}"
 PORT="${IRIS_PORT:-8080}"
 HOST_="${IRIS_HOST:-127.0.0.1}"
 CTX="${IRIS_CTX:-16384}"
@@ -86,8 +125,11 @@ fi
 say "starting llama-server: $MODEL  (ctx $CTX, host $HOST_:$PORT)"
 "$LLAMA_BIN" \
   -hf "$MODEL" \
+  --no-mmproj \
   --jinja \
   --embeddings \
+  --pooling mean \
+  --reasoning off \
   --ctx-size "$CTX" \
   --n-gpu-layers all \
   --flash-attn on \

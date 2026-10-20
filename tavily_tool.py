@@ -227,7 +227,7 @@ def speakable(result: dict, budget: str = "standard") -> str:
                 parts.append(f"According to {domain}, {first}.")
     text = " ".join(p for p in parts if p).strip()
     if not text:
-        text = "I could not find anything useful on that, sir."
+        text = "The network has nothing useful on that."
     return cfg.clip_words(text, budget)
 
 

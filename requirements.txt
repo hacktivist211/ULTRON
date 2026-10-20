@@ -1,69 +1,76 @@
 # ============================================================================
-# IRIS — Unified Requirements File
-# Python Target: 3.11
-# Install:
-#   pip install -r requirements.txt
-#   pip install -e CosyVoice/third_party/Matcha-TTS
-#   conda install -c conda-forge pynini -y
+# IRIS — Kokoro-82M + Parakeet TDT voice stack
+# Python 3.11, Fedora 44, RTX 4050 Max-Q 6 GB, CUDA 12.4
+#
+# IMPORTANT: these pins target Python 3.11. The conda *base* env here is
+# Python 3.14, which has no torch 2.6.0+cu124 wheel (hence "No matching
+# distribution found"). Always install inside the 3.11 env:
+#   conda activate iris && pip install -r requirements.txt
+#
+# System packages FIRST (Fedora):
+#   sudo dnf install -y espeak-ng ffmpeg
 # ============================================================================
 
 --extra-index-url https://download.pytorch.org/whl/cu124
 
-# ---- Core & Math -----------------------------------------------------------
-requests>=2.31,<3
-numpy>=1.26.4,<2.0
-urllib3>=2.0,<3
-pyarrow>=14.0.0
-
-# ---- PyTorch Stack (CUDA 12.4) ---------------------------------------------
+# ---- PyTorch (CUDA 12.4) ---------------------------------------------------
+# 2.6.0+cu124 is required: < 2.6 refuses to load bge-m3 .bin weights
+# (CVE-2025-32434) and Parakeet's safetensors use the same load path.
 torch==2.6.0+cu124
 torchaudio==2.6.0+cu124
 torchvision==0.21.0+cu124
 
-# ---- Hugging Face Ecosystem (Pinned to avoid legacy cached_download crash) --
-huggingface-hub==0.24.7
-transformers==4.44.2
-tokenizers==0.19.1
+# ---- Transformers (Parakeet TDT requires >= 5.6) ---------------------------
+# Parakeet TDT needs transformers 5.x: AutoModelForTDT / ParakeetForTDT only
+# exist from the 5.x line (4.5x ships ParakeetForCTC only). tokenizers /
+# huggingface-hub are resolved by pip (do not pin them here — pinning causes
+# conflicts across transformers minor versions).
+transformers>=5.6,<6
 sentencepiece>=0.1.99,<0.2
+safetensors>=0.4,<1
+librosa>=0.10          # ParakeetFeatureExtractor needs librosa (transformers 5)
 
-# ---- Voice: CosyVoice2 & Audio Processing ----------------------------------
-modelscope>=1.14.0
-hyperpyyaml>=1.2,<2
-conformer>=0.3,<0.4
-librosa>=0.10,<0.11
+# ---- TTS: Kokoro-82M -------------------------------------------------------
+# pykokoro[gpu] pulls onnxruntime-gpu + onnxvoice + inflect + soxr
+pykokoro[gpu]>=0.10.5
+onnxruntime-gpu>=1.18,<2      # explicit so pip does not silently pick CPU wheel
 inflect>=7.0,<8
-onnxruntime-gpu>=1.18,<2
-protobuf>=4.25,<6
-pyworld>=0.3.4,<1
-ruamel.yaml>=0.18,<1
-omegaconf>=2.3,<3
+soxr>=1.0
 soundfile>=0.12,<1
-tqdm>=4.66,<5
-g2p_en>=2.1.0
-WeTextProcessing>=1.0,<2
+
+# ---- STT audio I/O ---------------------------------------------------------
 sounddevice>=0.4.6,<0.5
 
-# ---- ASR / Transcription ---------------------------------------------------
-openai-whisper>=20231117
-faster-whisper>=1.0,<2
-ctranslate2>=4.3,<5
-
-# ---- Memory & Vector Embeddings --------------------------------------------
+# ---- Embeddings ------------------------------------------------------------
 sentence-transformers>=3.0,<6
+numpy>=1.26.4,<2.0
 
-# ---- Web Search ------------------------------------------------------------
+# ---- Web search ------------------------------------------------------------
 tavily-python>=0.5,<1
+ddgs>=9                 # maintained successor to duckduckgo-search (preferred)
+duckduckgo-search>=6.3,<9   # legacy fallback if ddgs is absent
 
-# ---- LangChain / Utilities ------------------------------------------------
+# ---- Memory / vector store -------------------------------------------------
 langchain>=0.3.14,<0.4
 langchain-core>=0.3.29,<0.4
 langchain-community>=0.3,<0.4
 langchain-text-splitters>=0.3,<0.4
 langchain-chroma>=0.2,<0.3
 chromadb>=0.5.18,<0.6
-pydantic>=2.5,<3
+posthog>=2.4,<3        # chromadb 0.5.x calls posthog.capture()<3 signature; 3+ raises on every event
 pymupdf>=1.24,<2
-duckduckgo-search>=6.3,<9
-rich>=13.7,<15
+
+# ---- Optional enrollment fallback (only used if Parakeet transcription fails)
+openai-whisper>=20231117
+faster-whisper>=1.0,<2
+ctranslate2>=4.3,<5
+
+# ---- Utilities -------------------------------------------------------------
+requests>=2.31,<3
+urllib3>=2.0,<3
+pyarrow>=14.0.0
 chardet>=5.2,<6
 pillow>=10.0,<12
+rich>=13.7,<15
+pydantic>=2.5,<3
+tqdm>=4.66,<5
