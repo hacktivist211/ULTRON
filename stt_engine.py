@@ -219,7 +219,8 @@ class ParakeetSTT:
         with torch.inference_mode():
             inputs = self.processor([x], sampling_rate=sr16)
             inputs.to(self.model.device, dtype=self.model.dtype)
-            generated = self.model.generate(**inputs, return_dict_in_generate=True)
+            generated = self.model.generate(
+                **inputs, return_dict_in_generate=True, max_new_tokens=256)
             text = self.processor.decode(generated.sequences, skip_special_tokens=True)
         dt = time.perf_counter() - t0
         # transformers >= 5's ParakeetProcessor.decode returns a list (one

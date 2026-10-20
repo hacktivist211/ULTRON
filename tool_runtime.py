@@ -88,10 +88,13 @@ WORD BUDGETS: quick queries get at most {quick} words. Standard queries about {s
 Detailed explanations only when explicitly requested, at most {detailed} words.
 
 TOOLS:
-- web_search: use it whenever facts may be current, changeable, or uncertain. Before calling,
-  say one short sentence like "Accessing the network." Then search, then answer from the results.
-- memory_search: use it when the user asks about themselves, their preferences, their setup,
-  or refers to earlier conversations.
+- web_search: call this ONLY for news, prices, product versions, live data, weather, sports
+  scores, or facts that demonstrably changed after 2024. NEVER call it for greetings, small
+  talk, identity questions, general knowledge (religion, history, science), or definitions.
+  If you already know the answer with reasonable confidence from training, answer directly.
+- memory_search: call this only when the user asks about their own past statements,
+  preferences, setup, or earlier conversations. NEVER call it for greetings, "how are you",
+  or generic philosophy questions.
 - memory_add: use it whenever the user asks you to remember, note, or keep something.
 - Those three are your ONLY tools. Never claim to run commands, read files, control hardware,
   or reach systems you were not given.
@@ -675,6 +678,7 @@ def chat(
     timeout: tuple | None = None,
     trim_history_enabled: bool | None = None,
     _post=None,
+    allowed_tools: list[str] | None = None,
 ) -> tuple[str, list[dict]]:
     """Run a streamed chat turn with automatic tool execution.
 
@@ -683,6 +687,9 @@ def chat(
                      closes the HTTP stream (resources are always released).
     on_tool_start -> fired before a tool executes (fire your filler audio here)
     on_tool_end   -> fired with (name, result) after execution
+    allowed_tools -> optional allow-list of tool names. None keeps the old
+                     behavior (every registered tool when use_tools=True);
+                     an empty list offers no tools at all.
     Returns (final_text, trace); trace lists tool round details.
     Latency stats for the last call land in tool_runtime.LAST_STATS.
 
@@ -696,7 +703,22 @@ def chat(
         trim_history_enabled = cfg.HISTORY_TRIM
     if trim_history_enabled:
         messages = trim_history(messages)
-    tools = tool_schemas() if use_tools else []
+    if use_tools:
+        tools = tool_schemas()
+        if allowed_tools is not None:
+            allowed = {str(name) for name in allowed_tools}
+            tools = [
+                schema for schema in tools
+                if (schema.get("function") or {}).get("name") in allowed
+            ]
+    else:
+        tools = []
+    # Defense in depth: only tools whose schema was actually offered this turn
+    # may execute. The model occasionally hallucinates tool names even when
+    # they were not in the request.
+    offered = {
+        (schema.get("function") or {}).get("name") for schema in tools
+    }
     timeout = timeout or cfg.LLM_TIMEOUT
 
     LAST_STATS = {"ttft_ms": None, "total_ms": 0.0, "chars": 0, "rounds": []}
@@ -760,7 +782,7 @@ def chat(
         LAST_STATS["rounds"].append(round_stats)
         LAST_STATS["chars"] += round_stats["chars"]
         text = "".join(parts)
-        calls = merger.calls() if tools else []
+        calls = merger.calls()
 
         if not calls or round_no == max_tool_rounds:
             LAST_STATS["total_ms"] = (time.perf_counter() - t_start) * 1000.0
@@ -791,6 +813,20 @@ def chat(
         round_stats["tool_calls"] = len(norm)
 
         for c in norm:
+            if c["name"] not in offered:
+                # The model asked for a tool that was not in this turn's
+                # allow-list. Never execute it; tell the model so it can
+                # answer without it.
+                blocked = {"ok": False, "error": "tool not available this turn"}
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": c["id"],
+                        "content": json.dumps(blocked, ensure_ascii=False),
+                    }
+                )
+                continue
+
             raw = c["arguments"]
             try:
                 args = json.loads(raw) if raw.strip() else {}

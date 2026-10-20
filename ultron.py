@@ -2,6 +2,7 @@
 """ULTRON - Parakeet STT + llama-server (Qwen3.5-4B Abliterated) + Kokoro TTS."""
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -28,6 +29,177 @@ def _looks_like_personal_fact(text: str) -> bool:
     """Cheap heuristic: does this utterance mention a durable personal detail?"""
     t = (text or "").lower()
     return any(cue in t for cue in _IMPORTANCE_CUES)
+
+
+class TurnCancelled(Exception):
+    """Raised inside the stream callback when the user presses Esc."""
+
+
+class KeyInterruptMonitor:
+    """Poll stdin for a single Esc keypress without extra dependencies.
+
+    POSIX uses cbreak mode + select; Windows uses msvcrt. If stdin is not an
+    interactive terminal the monitor declines to start and the turn simply
+    runs without interrupt support.
+    """
+
+    def __init__(self):
+        self.interrupted = threading.Event()
+        self._stop = threading.Event()
+        self._thread = None
+        self._fd = None
+        self._saved = None
+        self._cbreak = False
+        self._warned = False
+
+    def start(self) -> bool:
+        """Enter cbreak mode and start the polling thread. Never raises."""
+        if self._thread is not None and self._thread.is_alive():
+            return True
+        self.reset()
+        self._stop.clear()
+        if not self._enter():
+            if not self._warned:
+                print("[ultron] interrupt key unavailable (non-interactive stdin)",
+                      file=sys.stderr)
+                self._warned = True
+            return False
+        try:
+            self._thread = threading.Thread(
+                target=self._poll, daemon=True, name="esc-monitor")
+            self._thread.start()
+        except Exception:
+            self._restore()
+            self._thread = None
+            if not self._warned:
+                print("[ultron] interrupt key unavailable (non-interactive stdin)",
+                      file=sys.stderr)
+                self._warned = True
+            return False
+        return True
+
+    def _enter(self) -> bool:
+        if os.name == "nt":
+            try:
+                import msvcrt  # noqa: F401
+                return True
+            except Exception:
+                return False
+        try:
+            import termios
+            import tty
+
+            self._fd = sys.stdin.fileno()
+            if not os.isatty(self._fd):
+                return False
+            self._saved = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+            self._cbreak = True
+            return True
+        except Exception:
+            return False
+
+    def _poll(self) -> None:
+        if os.name == "nt":
+            try:
+                import msvcrt
+
+                while not self._stop.is_set():
+                    if msvcrt.kbhit():
+                        ch = msvcrt.getch()
+                        if ch in (b"\x1b", "\x1b"):
+                            self.interrupted.set()
+                            return
+                    time.sleep(0.02)
+            except Exception:
+                return
+            return
+
+        try:
+            import select
+
+            while not self._stop.is_set():
+                ready, _, _ = select.select([self._fd], [], [], 0.02)
+                if not ready:
+                    continue
+                if os.read(self._fd, 1) == b"\x1b":
+                    self.interrupted.set()
+                    return
+        except Exception:
+            return
+
+    def _restore(self) -> None:
+        if self._cbreak and self._saved is not None and self._fd is not None:
+            try:
+                import termios
+
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
+            except Exception:
+                pass
+        self._cbreak = False
+        self._saved = None
+
+    def stop(self) -> None:
+        """Stop polling and restore the terminal. Never raises."""
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            try:
+                thread.join(timeout=0.2)
+            except Exception:
+                pass
+        self._thread = None
+        self._restore()
+
+    def reset(self) -> None:
+        self.interrupted.clear()
+
+    def wait_for_esc(self, timeout: float | None = None) -> bool:
+        """Test helper: block until Esc is seen (or timeout)."""
+        return self.interrupted.wait(timeout)
+
+
+# --- lightweight pre-retrieval gate (Adaptive-RAG style, zero LLM calls) ---
+_TOOL_SETS = {
+    "simple": [],
+    "memory": ["memory_search", "memory_add"],
+    "standard": ["web_search", "memory_search", "memory_add"],
+}
+
+# classify_query's CASUAL_RE does not cover "how are you doing today", and a
+# farewell can be prefixed ("Auntie, goodbye."). Keep the supplement narrow so
+# real knowledge questions still go through the standard path.
+_CASUAL_EXTRA_RE = re.compile(
+    r"^(?:how\s+are\s+you(?:\s+doing)?(?:\s+today)?|"
+    r"how(?:'s| is)\s+it\s+going|how(?:'s| is)\s+your\s+day|"
+    r"what(?:'s| is)\s+up|you\s+good|you\s+okay|"
+    r"are\s+you\s+(?:there|awake|real))"
+    r"\b[?.!\s]*$",
+    re.IGNORECASE,
+)
+_FAREWELL_START_RE = re.compile(
+    r"^(?:bye|goodbye|farewell|see\s+ya|see\s+you(?:\s+later)?|"
+    r"talk\s+to\s+you\s+later|catch\s+you\s+later)\b",
+    re.IGNORECASE,
+)
+_FAREWELL_VOCATIVE_RE = re.compile(
+    r"[,;]\s*(?:bye|goodbye|farewell|see\s+ya|see\s+you(?:\s+later)?)\b"
+    r"[.!?~\s]*$",
+    re.IGNORECASE,
+)
+
+
+def _looks_casual(text: str) -> bool:
+    """True for short greetings/farewells that must never trigger tools."""
+    compact = " ".join((text or "").split())
+    if not compact:
+        return True
+    if _CASUAL_EXTRA_RE.match(compact):
+        return True
+    if len(compact.split()) > 6:
+        return False
+    return bool(_FAREWELL_START_RE.match(compact)
+                or _FAREWELL_VOCATIVE_RE.search(compact))
 
 
 class SpeechChunker:
@@ -106,6 +278,24 @@ class AudioPlayer:
                           f"({q.unfinished_tasks} item(s) pending)", file=sys.stderr)
                     return
 
+    def drain(self):
+        """Discard queued audio without playing it (used on turn cancellation).
+
+        Every dequeued item is acknowledged so wait_idle() cannot deadlock.
+        A shutdown sentinel is put back for the worker.
+        """
+        while True:
+            try:
+                item = self.queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if item is None:
+                    self.queue.put(None)
+                    return
+            finally:
+                self.queue.task_done()
+
     def close(self):
         self.queue.put(None)
         try:
@@ -141,6 +331,8 @@ class UltronEngine:
             print(f"[ultron] temporal memory skipped: {exc}", file=sys.stderr)
 
         self._fact_thread = None
+        self._keys = KeyInterruptMonitor()
+        self._stop_recording_event = threading.Event()
         self.history = []
         self.mic_rate = cfg.STT_SAMPLE_RATE
 
@@ -164,28 +356,100 @@ class UltronEngine:
         if f is not None:
             self.player.play(f[0], f[1])
 
-    def _record_and_transcribe(self, max_s=8.0, silence_s=1.0, threshold=0.01):
-        """Record with a simple RMS-based end-of-speech detector."""
-        print("[ultron] listening ...", end="", flush=True)
+    def _record_and_transcribe(self, max_s=60.0, silence_s=3.0, threshold=0.01):
+        """Record until Enter, a long silence, or the max_s safety net.
+
+        Enter is read by a daemon thread that only consumes a single line and
+        exits, so it cannot swallow later typed input.  The old RMS silence
+        auto-stop is retained as a fallback but only after at least 400 ms of
+        actual speech, and only after three seconds of silence.
+        """
+        print("[ultron] listening ... (press Enter when done)", end="", flush=True)
         block = int(self.mic_rate * 0.1)
-        frames, speaking, silence_run = [], False, 0
-        for _ in range(int(max_s / 0.1)):
-            chunk = sd.rec(block, samplerate=self.mic_rate, channels=1,
-                           dtype="float32", blocking=True)
-            sd.wait()
-            rms = float(np.sqrt(np.mean(chunk ** 2)))
-            frames.append(chunk)
-            if rms > threshold:
-                speaking, silence_run = True, 0
-            elif speaking:
-                silence_run += 1
-                if silence_run >= int(silence_s / 0.1):
+        frames, speaking, silence_run, speech_blocks = [], False, 0, 0
+        stop = self._stop_recording_event
+        stop.clear()
+        monitor_done = threading.Event()
+
+        def _watch_enter():
+            try:
+                stream = sys.stdin
+                if stream is None:
+                    return
+                try:
+                    fd = stream.fileno()
+                except Exception:
+                    fd = None
+                if fd is not None:
+                    import select
+
+                    while not monitor_done.is_set():
+                        ready, _, _ = select.select([fd], [], [], 0.1)
+                        if ready:
+                            stream.readline()
+                            stop.set()
+                            return
+                    return
+                # Non-file stdin (tests, StringIO): one blocking read.  The
+                # daemon exits after that single line and cannot be cancelled
+                # portably.
+                stream.readline()
+                stop.set()
+            except Exception:
+                return
+
+        monitor = None
+        if sys.stdin is None or not hasattr(sys.stdin, "readline"):
+            print("\n[ultron] Enter-to-stop unavailable (no stdin); "
+                  "using silence auto-stop", file=sys.stderr)
+        else:
+            monitor = threading.Thread(target=_watch_enter, daemon=True,
+                                       name="enter-stop-monitor")
+            try:
+                monitor.start()
+            except Exception as exc:
+                monitor = None
+                print(f"\n[ultron] Enter-to-stop unavailable ({exc}); "
+                      "using silence auto-stop", file=sys.stderr)
+
+        try:
+            for _ in range(max(1, int(max_s / 0.1))):
+                if stop.is_set():
                     break
+                chunk = sd.rec(block, samplerate=self.mic_rate, channels=1,
+                               dtype="float32", blocking=True)
+                sd.wait()
+                rms = float(np.sqrt(np.mean(chunk ** 2)))
+                frames.append(chunk)
+                if rms > threshold:
+                    speaking, silence_run = True, 0
+                    speech_blocks += 1
+                elif speaking:
+                    silence_run += 1
+                    if (speech_blocks >= 4
+                            and silence_run >= int(silence_s / 0.1)):
+                        break
+        finally:
+            monitor_done.set()
+            stop.clear()
         print(" done")
         if not speaking:
             return ""
         audio = np.concatenate(frames).flatten()
         return self.stt.transcribe_array(audio, self.mic_rate).get("text", "").strip()
+
+    def _abort_turn(self):
+        """Discard the in-flight turn and acknowledge the re-listen."""
+        try:
+            self.player.drain()
+        except Exception as exc:
+            print(f"[ultron] audio drain skipped: {exc}", file=sys.stderr)
+        print("[ultron] turn cancelled — listening again")
+        self._speak("Listening again.")
+        try:
+            self.player.wait_idle(timeout=2.0)
+        except TypeError:  # very old/stub player without a timeout argument
+            self.player.wait_idle()
 
     def listen_once(self) -> str:
         if self.stt is None:
@@ -203,6 +467,18 @@ class UltronEngine:
             return
         t_start = time.perf_counter()
 
+        # --- lightweight retrieval gate: classify once, reuse everywhere ---
+        try:
+            kind = classify_query(user_text).get("kind", "standard")
+        except Exception as exc:
+            print(f"[ultron] query classifier failed ({exc}); offering all tools",
+                  file=sys.stderr)
+            kind = "standard"
+        if kind == "standard" and _looks_casual(user_text):
+            kind = "simple"
+        allowed_tools = list(_TOOL_SETS.get(kind, _TOOL_SETS["standard"]))
+        print(f"[ultron] tools: {kind} -> {','.join(allowed_tools) or 'none'}")
+
         # --- long-term memory reads (all before the LLM call, budget < 30 ms) ---
         turn_no = None
         extra_blocks = []
@@ -216,7 +492,7 @@ class UltronEngine:
                 print(f"[ultron] temporal context skipped: {exc}", file=sys.stderr)
 
             try:
-                if classify_query(user_text).get("kind") == "memory":
+                if kind == "memory":
                     recalled = self.temporal.format_hits(self.temporal.recall(user_text))
                     if recalled:
                         extra_blocks.append(recalled)
@@ -230,8 +506,12 @@ class UltronEngine:
                 print(f"[ultron] temporal recall skipped: {exc}", file=sys.stderr)
 
         extra = "\n\n".join(extra_blocks)
+        # Simple greetings do not need durable-memory retrieval either; skip
+        # the embedding lookup and keep the turn cheap.
         sys_prompt = tool_runtime.build_system(
-            budget="standard", memory_query=user_text, store=self.memory,
+            budget="standard",
+            memory_query=None if kind == "simple" else user_text,
+            store=None if kind == "simple" else self.memory,
             extra=extra)
         messages = ([{"role": "system", "content": sys_prompt}]
                     + self.history[-6:]
@@ -241,6 +521,8 @@ class UltronEngine:
 
         def on_delta(piece):
             nonlocal filler_played
+            if self._keys is not None and self._keys.interrupted.is_set():
+                raise TurnCancelled()
             full_response.append(piece)
             for clause in chunker.feed(piece):
                 print(clause, end=" ", flush=True)
@@ -254,9 +536,17 @@ class UltronEngine:
             print(f"\n[ultron] >>> {name} ...")
 
         try:
-            _, _trace = tool_runtime.chat(
-                messages=messages, on_delta=on_delta,
-                on_tool_start=on_tool_start, use_tools=True)
+            try:
+                if self._keys is not None:
+                    self._keys.start()
+                _, _trace = tool_runtime.chat(
+                    messages=messages, on_delta=on_delta,
+                    on_tool_start=on_tool_start,
+                    use_tools=bool(allowed_tools),
+                    allowed_tools=allowed_tools)
+            finally:
+                if self._keys is not None:
+                    self._keys.stop()
             for clause in chunker.flush():
                 print(clause, end=" ", flush=True)
                 self._speak(clause)
@@ -292,6 +582,9 @@ class UltronEngine:
                     self._fact_thread.start()
             except Exception as exc:
                 print(f"[ultron] memory write skipped: {exc}", file=sys.stderr)
+        except TurnCancelled:
+            self._abort_turn()
+            return
         except Exception as err:
             print(f"\n[ultron] error: {err}")
             self._speak("My link to the language core is broken. Repair it.")
