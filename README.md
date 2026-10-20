@@ -29,7 +29,7 @@ python test_streaming.py                  # offline 49 checks (real socket)
 python test_integration.py                # live PASS/FAIL/SKIP
 ```
 
-Full instructions: **§9. Installation**, **§10. Configuration**.
+Full instructions: **§10. Installation**, **§11. Configuration reference**.
 
 ---
 
@@ -167,7 +167,7 @@ sequenceDiagram
 
     LS-->>TR: first SSE token (~TTFT)
     TR->>CH: on_delta(piece)
-    CH->>TT: first clause (split on .!? , ; :)
+    CH->>TT: first clause (split on . ! ? , and colon or semicolon)
     TT->>SP: audio → play
 
     Note over TR,LS: model decides to call a tool
@@ -260,22 +260,22 @@ sequenceDiagram
     participant EX as execute_tool
     participant TAV as tavily / memory
 
-    TR->>LS: POST with tools=[web_search, memory_search, memory_add]
+    TR->>LS: POST with tools = web_search, memory_search, memory_add
     loop SSE stream
         LS-->>TR: delta.content "Accessing the network."
         TR->>TR: on_delta → chunker → TTS
-        LS-->>TR: delta.tool_calls[0].function.name = "web_search"
-        LS-->>TR: delta.tool_calls[0].function.arguments = "{\"qu"
-        LS-->>TR: delta.tool_calls[0].function.arguments = "ery\":\"latest python\"}"
+        LS-->>TR: delta.tool_calls[0].function.name = web_search
+        LS-->>TR: delta.tool_calls[0].function.arguments fragment 1
+        LS-->>TR: delta.tool_calls[0].function.arguments fragment 2
         TR->>MER: feed each fragment
     end
 
-    MER-->>TR: complete call {id, name, arguments}
-    TR->>TR: json.loads(arguments); reject if not an object
+    MER-->>TR: complete call (id, name, arguments)
+    TR->>TR: json.loads(arguments) and reject if not an object
     TR->>TR: on_tool_start("web_search")
-    TR->>EX: execute_tool("web_search", {"query": "latest python"})
+    TR->>EX: execute_tool("web_search", args)
     EX->>TAV: run_tool(args)
-    TAV-->>EX: {"ok": true, "results": [...], "_ms": 843}
+    TAV-->>EX: JSON result (ok, results, _ms)
     EX-->>TR: result
     TR->>TR: on_tool_end(name, result)
     TR->>LS: assistant message (content + tool_calls)
