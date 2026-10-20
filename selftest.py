@@ -402,6 +402,137 @@ def test_memory_restart():
         Path(str(db) + suffix).unlink(missing_ok=True)
 
 
+def test_ultron_auto_memory():
+    print("\n== ultron automatic memory (offline, stub chat) ==")
+    import shutil
+    import types
+
+    import memory_store
+    import stt_engine
+    import tool_runtime
+    import tts_engine
+
+    # ultron.py hard-requires sounddevice; inject a no-op stub when the real
+    # package (and an audio device) is not available in this test environment.
+    injected_sd = False
+    try:
+        import sounddevice  # noqa: F401
+    except ImportError:
+        fake_sd = types.ModuleType("sounddevice")
+        fake_sd.OutputStream = object
+        fake_sd.rec = lambda *a, **k: None
+        fake_sd.wait = lambda: None
+        sys.modules["sounddevice"] = fake_sd
+        injected_sd = True
+
+    import ultron
+
+    tmp = Path(tempfile.mkdtemp(prefix="iris_st_ultron_mem_"))
+    orig_memory_db = cfg.MEMORY_DB
+    orig_shared = memory_store._SHARED
+    orig_player = ultron.AudioPlayer
+    orig_temporal = ultron.TemporalMemory
+    orig_get_stt = stt_engine.get_stt
+    orig_get_tts = tts_engine.get_tts
+    orig_chat = tool_runtime.chat
+    engine = None
+
+    class _FakePlayer:
+        def __init__(self, *a, **k):
+            pass
+
+        def play(self, *a, **k):
+            pass
+
+        def wait_idle(self, timeout=None):
+            pass
+
+        def close(self):
+            pass
+
+    captured = {}
+
+    def fake_chat(messages=None, on_delta=None, on_tool_start=None,
+                  use_tools=True, **kwargs):
+        captured["messages"] = messages
+        if on_delta:
+            on_delta("noted")
+        return "noted", []
+
+    try:
+        memory_store._SHARED = None
+        cfg.MEMORY_DB = tmp / "memory.db"
+        ultron.AudioPlayer = _FakePlayer
+        ultron.TemporalMemory = lambda: orig_temporal(
+            db_path=str(tmp / "temporal_memory.db"), visual=False)
+        stt_engine.get_stt = lambda: None
+        tts_engine.get_tts = lambda: None
+        tool_runtime.chat = fake_chat
+
+        engine = ultron.UltronEngine()
+        check("ultron engine builds without audio hardware",
+              engine.temporal is not None and engine.memory is not None)
+
+        # Keep the test fully offline: no embedding HTTP call in the worker.
+        engine.memory._embed_batch = lambda texts: None
+        engine.temporal.forget("all")
+        engine.run_turn("I live in Kyoto and I prefer dark mode")
+
+        if engine._fact_thread is not None:
+            engine._fact_thread.join(timeout=10)
+
+        rows = engine.temporal._conn.execute(
+            "SELECT query, answer, verdict FROM turns").fetchall()
+        check("one temporal row per voice turn", len(rows) == 1,
+              f"rows={len(rows)}")
+        check("temporal row keeps query + reply",
+              bool(rows)
+              and rows[0]["query"] == "I live in Kyoto and I prefer dark mode"
+              and rows[0]["answer"] == "noted"
+              and rows[0]["verdict"] == "VOICE",
+              f"row={dict(rows[0]) if rows else None}")
+
+        facts = engine.memory.db.execute(
+            "SELECT content, source FROM memories").fetchall()
+        captured_fact = [c for c, _s in facts
+                         if "kyoto" in c.lower() and "dark mode" in c.lower()]
+        check("casual fact auto-captured into memory.db",
+              len(captured_fact) >= 1, f"rows={facts}")
+        check("auto-captured fact tagged voice_auto",
+              any(s == "voice_auto" for _c, s in facts), f"rows={facts}")
+
+        check("history still tracks the immediate turn",
+              len(engine.history) == 2
+              and engine.history[0]["role"] == "user"
+              and engine.history[1]["role"] == "assistant")
+        sys_text = (captured.get("messages") or [{}])[0].get("content", "")
+        check("temporal context injected before chat",
+              "CURRENT TIME:" in sys_text and "LAST INTERACTION:" in sys_text)
+
+        engine.temporal.forget("last")
+        check("forget removes the most recent turn",
+              engine.temporal.stats()["turns"] == 0)
+    finally:
+        try:
+            if engine is not None:
+                if engine.memory is not None:
+                    engine.memory.close()
+                if engine.temporal is not None:
+                    engine.temporal._conn.close()
+        except Exception:
+            pass
+        cfg.MEMORY_DB = orig_memory_db
+        memory_store._SHARED = orig_shared
+        ultron.AudioPlayer = orig_player
+        ultron.TemporalMemory = orig_temporal
+        stt_engine.get_stt = orig_get_stt
+        tts_engine.get_tts = orig_get_tts
+        tool_runtime.chat = orig_chat
+        if injected_sd:
+            sys.modules.pop("sounddevice", None)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_tavily_edge():
     print("\n== tavily_tool: empty + failure shapes (Critical Issue 5) ==")
     import tavily_tool
@@ -710,6 +841,7 @@ def main() -> int:
     test_memory_store()
     test_memory_restart()
     test_memory_import()
+    test_ultron_auto_memory()
     test_tavily_offline()
     test_tavily_edge()
     test_streaming_core()

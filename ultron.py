@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """ULTRON - Parakeet STT + llama-server (Qwen3.5-4B Abliterated) + Kokoro TTS."""
+import os
 import queue
 import sys
 import threading
+import time
 
 import numpy as np
 
@@ -11,12 +13,21 @@ import stt_engine
 import tool_runtime
 import tts_engine
 import voice_cache
+from evaluator_router import classify_query
+from memory_import import _IMPORTANCE_CUES, score_importance
 from memory_store import get_store
+from temporal_memory import TemporalMemory
 
 try:
     import sounddevice as sd
 except ImportError:
     sys.exit("sounddevice is required: pip install sounddevice")
+
+
+def _looks_like_personal_fact(text: str) -> bool:
+    """Cheap heuristic: does this utterance mention a durable personal detail?"""
+    t = (text or "").lower()
+    return any(cue in t for cue in _IMPORTANCE_CUES)
 
 
 class SpeechChunker:
@@ -117,7 +128,19 @@ class UltronEngine:
             print("[ultron] TTS unavailable - text-only mode")
 
         self.player = AudioPlayer()
-        self.memory = get_store()
+        try:
+            self.memory = get_store()
+        except Exception as exc:
+            self.memory = None
+            print(f"[ultron] memory store skipped: {exc}", file=sys.stderr)
+
+        try:
+            self.temporal = TemporalMemory()
+        except Exception as exc:
+            self.temporal = None
+            print(f"[ultron] temporal memory skipped: {exc}", file=sys.stderr)
+
+        self._fact_thread = None
         self.history = []
         self.mic_rate = cfg.STT_SAMPLE_RATE
 
@@ -178,8 +201,38 @@ class UltronEngine:
     def run_turn(self, user_text: str):
         if not user_text:
             return
+        t_start = time.perf_counter()
+
+        # --- long-term memory reads (all before the LLM call, budget < 30 ms) ---
+        turn_no = None
+        extra_blocks = []
+        if self.temporal is not None:
+            try:
+                turn_no = self.temporal.begin_turn()
+                note = self.temporal.build_temporal_context()
+                if note:
+                    extra_blocks.append(note)
+            except Exception as exc:
+                print(f"[ultron] temporal context skipped: {exc}", file=sys.stderr)
+
+            try:
+                if classify_query(user_text).get("kind") == "memory":
+                    recalled = self.temporal.format_hits(self.temporal.recall(user_text))
+                    if recalled:
+                        extra_blocks.append(recalled)
+                else:
+                    recent = self.temporal.format_recent(
+                        self.temporal.recent_turns(count=2))
+                    if recent:
+                        extra_blocks.append(
+                            "RECENT CONVERSATION THREAD (for continuity):\n" + recent)
+            except Exception as exc:
+                print(f"[ultron] temporal recall skipped: {exc}", file=sys.stderr)
+
+        extra = "\n\n".join(extra_blocks)
         sys_prompt = tool_runtime.build_system(
-            budget="standard", memory_query=user_text, store=self.memory)
+            budget="standard", memory_query=user_text, store=self.memory,
+            extra=extra)
         messages = ([{"role": "system", "content": sys_prompt}]
                     + self.history[-6:]
                     + [{"role": "user", "content": user_text}])
@@ -213,6 +266,32 @@ class UltronEngine:
             if reply:
                 self.history += [{"role": "user", "content": user_text},
                                  {"role": "assistant", "content": reply}]
+
+            # --- persistent writes: after the answer is fully spoken ---
+            try:
+                if self.temporal is not None and turn_no is not None:
+                    self.temporal.save_turn(
+                        query=user_text, answer=reply, verdict="VOICE",
+                        sources=[], turn_no=turn_no,
+                        elapsed=time.perf_counter() - t_start)
+
+                if self.memory is not None and _looks_like_personal_fact(user_text):
+                    fact = user_text
+
+                    def _capture_fact():
+                        try:
+                            self.memory.add(
+                                fact, speaker="user", source="voice_auto",
+                                kind="fact", importance=score_importance(fact, "user"))
+                        except Exception as exc:
+                            print(f"[ultron] fact capture skipped: {exc}",
+                                  file=sys.stderr)
+
+                    self._fact_thread = threading.Thread(
+                        target=_capture_fact, daemon=True, name="fact-capture")
+                    self._fact_thread.start()
+            except Exception as exc:
+                print(f"[ultron] memory write skipped: {exc}", file=sys.stderr)
         except Exception as err:
             print(f"\n[ultron] error: {err}")
             self._speak("My link to the language core is broken. Repair it.")
@@ -226,6 +305,59 @@ class UltronEngine:
             except (KeyboardInterrupt, EOFError):
                 print("\n[ultron] offline."); break
             if not text:
+                continue
+            lowered = text.strip().lower()
+            if lowered in ("memory stats", "what do you remember",
+                           "forget the last thing"):
+                if self.temporal is None or self.memory is None:
+                    self._speak("Memory is offline.")
+                    self.player.wait_idle()
+                    continue
+                try:
+                    if lowered == "memory stats":
+                        tstats = self.temporal.stats()
+                        mstats = self.memory.stats()
+                        sizes = []
+                        for path in (getattr(self.temporal, "db_path", None),
+                                     mstats.get("db_path")):
+                            try:
+                                sizes.append(f"{os.path.getsize(path) / 1024:.1f} kilobytes")
+                            except (OSError, TypeError):
+                                continue
+                        oldest = str(tstats.get("oldest") or "none")[:10]
+                        turns = tstats.get("turns", 0)
+                        facts = mstats.get("total", 0)
+                        spoken = (
+                            f"{turns} turn{'s' if turns != 1 else ''} across "
+                            f"{tstats.get('sessions', 0)} sessions. "
+                            f"{facts} durable fact{'s' if facts != 1 else ''}. "
+                            f"Oldest turn: {oldest}. "
+                            f"Database sizes: {', '.join(sizes) or 'unknown'}."
+                        )
+                        self._speak(cfg.speech_clean(spoken))
+                    elif lowered == "what do you remember":
+                        hits = self.temporal.recent_turns(count=3)
+                        if not hits:
+                            self._speak("I do not have any recorded turns yet.")
+                        else:
+                            bits = []
+                            for hit in hits:
+                                when = hit.get("when") or "earlier"
+                                query = cfg.speech_clean(
+                                    hit.get("query", ""), max_len=120)
+                                bits.append(f"{when} you said: {query}")
+                            self._speak(cfg.speech_clean(
+                                "Here is what I remember. " + " ".join(bits)))
+                    else:  # forget the last thing
+                        deleted = self.temporal.forget("last")
+                        if deleted:
+                            self._speak("Forgotten. I removed the most recent turn.")
+                        else:
+                            self._speak("There was nothing to forget.")
+                except Exception as exc:
+                    print(f"[ultron] memory command skipped: {exc}", file=sys.stderr)
+                    self._speak("Memory is offline.")
+                self.player.wait_idle()
                 continue
             if text.lower() in ("exit", "quit", "goodbye", "bye"):
                 self._speak("Going dark. Call me when you need me."); self.player.wait_idle(); break
