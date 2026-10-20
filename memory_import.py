@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Import memories from your other models into IRIS.
+"""Import memories from your other models into ULTRON.
 
 Feed it any export file; the format is auto-detected:
   - ChatGPT  : conversations.json from the ChatGPT export ZIP (mapping tree)
@@ -7,7 +7,7 @@ Feed it any export file; the format is auto-detected:
   - Gemini   : Takeout MyActivity.json / prompt-response JSON
   - Generic  : JSON or JSONL of {prompt, response}, {role, content},
                or {messages: [...]} conversation objects
-  - Text     : any .txt / .md / .chat file, including IRIS chat.txt dumps and
+  - Text     : any .txt / .md / .chat file, including ULTRON chat.txt dumps and
                pasted transcripts with User:/Assistant: markers
 
 Everything is stored "correctly and properly":
@@ -212,7 +212,7 @@ _PLAIN_MARKERS = re.compile(
     r"(?im)^\s*(?:user|you|human|me|neeraj)\s*[:>]\s*(.*)$"
 )
 _PLAIN_AI_MARKERS = re.compile(
-    r"(?im)^\s*(?:assistant|ai|chatgpt|claude|gemini|copilot|iris|ultron)\s*[:>]\s*(.*)$"
+    r"(?im)^\s*(?:assistant|ai|chatgpt|claude|gemini|copilot|ultron)\s*[:>]\s*(.*)$"
 )
 
 

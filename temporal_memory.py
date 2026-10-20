@@ -1,4 +1,4 @@
-"""Temporal episodic memory for the IRIS self-corrective RAG pipeline.
+"""Temporal episodic memory for the ULTRON self-corrective RAG pipeline.
 
 Pragmatic implementation of the time-aware memory plan:
 
@@ -26,22 +26,22 @@ import textwrap
 import threading
 import uuid
 
-# Store identity (see iris_config.py MEMORY MAP for the project-wide picture):
-# this database is the CRAG stack's EPISODIC turn log - distinct from IRIS's
+# Store identity (see ultron_config.py MEMORY MAP for the project-wide picture):
+# this database is the CRAG stack's EPISODIC turn log - distinct from ULTRON's
 # durable personal memory (memory.db owned by memory_store.py). The file is
 # now named temporal_memory.db to prevent confusion between the two stores;
-# a legacy iris_memory/memory.db from an older run is migrated automatically
+# a legacy ultron_memory/memory.db from an older run is migrated automatically
 # (copied - the original is kept untouched as a backup).
-MEMORY_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iris_memory")
+MEMORY_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ultron_memory")
 LEGACY_MEMORY_DB_PATH = os.path.join(MEMORY_DIRECTORY, "memory.db")
-MEMORY_DB_PATH = os.getenv("IRIS_TEMPORAL_DB") or os.path.join(
+MEMORY_DB_PATH = os.getenv("ULTRON_TEMPORAL_DB") or os.path.join(
     MEMORY_DIRECTORY, "temporal_memory.db"
 )
 VISUAL_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visual_memory")
 
 
 def _migrate_legacy_db(db_path):
-    """Copy a legacy iris_memory/memory.db to temporal_memory.db once.
+    """Copy a legacy ultron_memory/memory.db to temporal_memory.db once.
 
     Non-destructive by design: the legacy file is never modified or deleted;
     if the new file already exists, nothing happens.
@@ -430,7 +430,7 @@ class TemporalMemory:
         self._session_turns += 1
         self._last_activity = now_local
         if self._archive.enabled:
-            content = f"User: {query}\n\nIRIS: {answer or ''}"
+            content = f"User: {query}\n\nULTRON: {answer or ''}"
             try:
                 threading.Thread(
                     target=self._archive.archive,
@@ -656,7 +656,7 @@ class TemporalMemory:
             lines.append(f"- [{when}] User: {turn.get('query', '')}")
             answer = turn.get("answer")
             if answer:
-                lines.append(f"  IRIS: {answer}")
+                lines.append(f"  ULTRON: {answer}")
         return "\n".join(lines) if lines else ""
 
     def format_hits(self, hits):
@@ -668,7 +668,7 @@ class TemporalMemory:
             ]
             answer = hit.get("answer")
             if answer:
-                lines.append(f"IRIS answered: {answer}")
+                lines.append(f"ULTRON answered: {answer}")
             blocks.append("\n".join(lines))
         return "\n\n".join(blocks) if blocks else ""
 

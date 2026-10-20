@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runtime voice cache for IRIS - instant boot voice + zero-latency fillers.
+"""Runtime voice cache for ULTRON - instant boot voice + zero-latency fillers.
 
 The TTS engine itself is Kokoro-82M (tts_engine.py: pykokoro primary, the
 official kokoro KPipeline as fallback). This module caches its two
@@ -27,12 +27,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import iris_config as cfg
+import ultron_config as cfg
 from tts_engine import METRICS, SAMPLE_RATE, get_tts  # re-exported for callers
 
 
 def _cache_path(name: str) -> Path:
-    return cfg.IRIS_DIR / name
+    return cfg.ULTRON_DIR / name
 
 
 def warm(line: str | None = None, force: bool = False):

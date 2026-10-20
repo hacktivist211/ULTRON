@@ -5,7 +5,7 @@ import os
 #
 # CRAG_BACKEND=llamaserver  (DEFAULT)
 #   Every CRAG LLM call - generation, grading, refinement, rewriting - goes
-#   through the SAME llama-server (Qwen3.5-4B) that powers the primary IRIS
+#   through the SAME llama-server (Qwen3.5-4B) that powers the primary ULTRON
 #   voice runtime. One server, one resident model, zero extra VRAM: this
 #   pipeline can never silently load a second heavyweight model onto the
 #   6 GB GPU because it has no model of its own to load. In this mode CRAG
@@ -35,7 +35,7 @@ CRAG_MAX_TOKENS = int(os.getenv("CRAG_MAX_TOKENS", "1024"))
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 GENERATOR_MODEL = os.getenv("CRAG_MODEL", "granite4.2:3b")
 
-SYSTEM_PROMPT = """You are IRIS, a friendly, honest and precise research assistant connected to a self-corrective retrieval pipeline. You keep a time-stamped long-term memory of your interactions with the user.
+SYSTEM_PROMPT = """You are ULTRON, a friendly, honest and precise research assistant connected to a self-corrective retrieval pipeline. You keep a time-stamped long-term memory of your interactions with the user.
 
 ANSWERING RULES
 1. Ground every factual claim in the CONTEXT block of the user message. Facts, numbers, names, dates and quotes must come from the context.
@@ -85,7 +85,7 @@ def _stream_llamaserver(messages):
     Reasoning blocks (thinking tags / reasoning_content) are filtered by the
     shared client, so only the visible answer is yielded.
     """
-    import tool_runtime  # same flat IRIS directory; single SSE implementation
+    import tool_runtime  # same flat ULTRON directory; single SSE implementation
 
     for ev in tool_runtime.stream_completion(
         _payload_messages(messages),

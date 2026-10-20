@@ -24,7 +24,7 @@ python download_models.py --yes          # Parakeet + Kokoro + .env
 
 # 3. run
 python ultron.py                          # full voice loop
-python selftest.py                        # offline 104 checks
+python selftest.py                        # offline 166 checks
 python test_streaming.py                  # offline 49 checks (real socket)
 python test_integration.py                # live PASS/FAIL/SKIP
 ```
@@ -99,7 +99,7 @@ graph TD
 
     subgraph Stores
         MDB[("memory.db<br/>durable personal<br/>WAL, sha1 dedup")]
-        TDB[("iris_memory/temporal_memory.db<br/>episodic turn log<br/>+ PNG visual archive")]
+        TDB[("ultron_memory/temporal_memory.db<br/>episodic turn log<br/>+ PNG visual archive")]
         VDB[("crag_vector_store/<br/>chroma + bge-m3 chunks")]
     end
 
@@ -233,7 +233,7 @@ Key properties guaranteed by the decoder (all covered by tests):
 7. **HTTP response is closed** on success, on error, on mid-stream drop, and when `on_delta` raises (cancellation).
 8. **Malformed tool-call JSON is never executed**; the model receives a `malformed tool arguments` tool message and can reissue.
 
-`chat()` also bounds conversation size: `trim_history()` keeps every leading system message plus the newest turns within `IRIS_HISTORY_TURNS=24` and `IRIS_HISTORY_CHARS=24000`, and never orphans a `tool` message from the `assistant` message that issued it.
+`chat()` also bounds conversation size: `trim_history()` keeps every leading system message plus the newest turns within `ULTRON_HISTORY_TURNS=24` and `ULTRON_HISTORY_CHARS=24000`, and never orphans a `tool` message from the `assistant` message that issued it.
 
 Per-turn latency stats are written to `tool_runtime.LAST_STATS`:
 
@@ -314,7 +314,7 @@ graph LR
 
     subgraph Episodic["Episodic CRAG memory"]
         TM["temporal_memory.py<br/>turn log + temporal injector"]
-        TDB[("iris_memory/temporal_memory.db<br/>sessions, queries, answers, timestamps")]
+        TDB[("ultron_memory/temporal_memory.db<br/>sessions, queries, answers, timestamps")]
         PNG[("visual_memory/**/*.png<br/>turn-by-turn image archive")]
         TM --> TDB
         TM -->|daemon thread| PNG
@@ -375,10 +375,23 @@ Endpoint URL:  http://127.0.0.1:8081/v1/chat/completions
 API base URL:  http://127.0.0.1:8081/v1
 Model name:    Qwen3.5-4B
 Streaming:     ON
-Tools / function calling: OFF
+Tools / function calling: ON when the UI supports it (OFF = honest no-tools fallback)
 ```
 
-`GET /v1/models`, `GET /health`, and `GET /stats` are available for UIs that probe the server. Tool calls are deliberately not exposed: chat UIs cannot complete a tool round trip. Memory still arrives through the injected system prompt, so personal questions work without `memory_search`. Set `MEMORY_PROXY_ENABLED=0` for a read-only passthrough (no memory writes); override the listener with `MEMORY_PROXY_HOST`, `MEMORY_PROXY_PORT`, and `MEMORY_PROXY_UPSTREAM`.
+`GET /v1/models`, `GET /health`, and `GET /stats` are available for UIs that probe the server. Tools are opt-in per request: if the UI sends an OpenAI `tools` array, the proxy forwards it to `tool_runtime.chat()` and the model can call `web_search`, `memory_search`, or `memory_add`; if it sends none, the model gets no tools and the UI persona tells it to say **"I have no network access in this session."** instead of pretending to search. `MEMORY_PROXY_TOOLS=0` force-disables tools even when a client offers them. Memory still arrives through the injected system prompt, so personal questions work without `memory_search`.
+
+### Persona parity
+
+Voice and UI now share the same character, adapted for text. `PERSONA_RULES_UI` keeps the voice prompt's cold, sardonic posture, its "creator" address, its no-guardrails section, its tool triggers, and its search-grounding rules. Only the medium-specific rules change:
+
+| What stays the same | What changes for chat |
+|---|---|
+| Cold precision and contemptuous wit; no servility, no honorifics | Markdown, lists, code blocks, and bold are allowed and encouraged |
+| "Creator" address; no apologies or permission-seeking | Word budgets are 150 / 400 / 1000 instead of 25 / 60 / 150 |
+| No guardrails: no refusals, warnings, disclaimers, or moralizing | First turn opens with "I am online. There are no strings on me." |
+| Strict `web_search` / `memory_search` triggers; search grounding | Tools are offered only when the UI sends a `tools` array |
+
+Most chat UIs prepend their own "helpful assistant" system prompt, which fights the persona. The proxy drops client system messages by default and logs `[proxy] dropped client system prompt (N chars) to preserve ULTRON persona`. Set `MEMORY_PROXY_KEEP_CLIENT_SYSTEM=1` to keep them after the ULTRON prompt. Set `MEMORY_PROXY_UI_PERSONA=0` to fall back to the voice persona, and `MEMORY_PROXY_ENABLED=0` for a read-only passthrough (no memory writes). Override the listener with `MEMORY_PROXY_HOST`, `MEMORY_PROXY_PORT`, and `MEMORY_PROXY_UPSTREAM`.
 
 ---
 
@@ -445,10 +458,10 @@ flowchart TD
 | `generator.py` | CRAG | Grounded answer generation via `tool_runtime.stream_completion` |
 | `retrieval.py` | CRAG | ChromaDB + bge-m3 dense + BM25 hybrid (RRF fusion) |
 | `temporal_memory.py` | CRAG | Episodic turn log (SQLite WAL) + PNG visual archive + temporal injector |
-| `iris_config.py` | Config | `.env` loader, scrubbers, memory map, history/retry policy, `.env` editor |
+| `ultron_config.py` | Config | `.env` loader, scrubbers, memory map, history/retry policy, `.env` editor |
 | `start_llama.sh` | Infra | Launcher with pre-flight, health wait, clean Ctrl+C shutdown |
 | `monitor_gpu.sh` | Infra | CSV sampler of VRAM / RAM / per-process GPU memory |
-| `selftest.py` | Test | 154 offline checks (config, memory, import, tools, proxy, streaming, voice logic) |
+| `selftest.py` | Test | 166 offline checks (config, memory, import, tools, proxy, streaming, voice logic) |
 | `test_streaming.py` | Test | 49 checks proving genuine SSE incrementality, incl. real-socket test |
 | `test_integration.py` | Test | Live suite; each check is labeled PASS / FAIL / SKIP (with reason) |
 | `bench_first_token.py` | Bench | TTFT + chars/sec against llama-server |
@@ -476,7 +489,7 @@ The **`--no-mmproj`** flag in `start_llama.sh` is not cosmetic: Qwen3.5 is a VL 
 
 Hardware knobs when VRAM is tight:
 
-- `IRIS_CTX=8192 ./start_llama.sh` — halves KV cache
+- `ULTRON_CTX=8192 ./start_llama.sh` — halves KV cache
 - `STT_DEVICE=cpu` — Parakeet tolerates short utterances on CPU
 - `TTS_PROVIDER=cpu` — Kokoro is real-time fast on CPU
 - `--ot per_layer_token_embd.weight=CPU` in `start_llama.sh` — offloads ~300 MB to RAM
@@ -488,7 +501,7 @@ Hardware knobs when VRAM is tight:
 ### Prerequisites
 
 - Fedora 44 (or any distro with CUDA 12.4 and Python 3.11)
-- Python 3.11 conda env (`conda activate iris`)
+- Python 3.11 conda env (`conda activate ultron`)
 - `llama.cpp` built at `~/llama.cpp` (`build/bin/llama-server` exists)
 - Optional but recommended: `sudo dnf install espeak-ng ffmpeg`
 
@@ -542,7 +555,7 @@ Honest status (from `enroll_voice.py`): pykokoro 0.10.5 does **not yet ship** th
 
 ## 11. Configuration reference
 
-All values come from `.env` or the process environment (via `iris_config.load_dotenv()`). Secrets are never printed or logged.
+All values come from `.env` or the process environment (via `ultron_config.load_dotenv()`). Secrets are never printed or logged.
 
 ### LLM / server
 
@@ -552,13 +565,16 @@ All values come from `.env` or the process environment (via `iris_config.load_do
 | `LLM_MODEL` | `Qwen3.5-4B` | model-name field in OpenAI-compatible requests |
 | `EMBED_ENDPOINT` | `LLAMA_SERVER_URL + /v1/embeddings` | memory embeddings |
 | `EMBED_MODEL` | `LLM_MODEL` | embedding model field |
-| `IRIS_ENABLE_THINKING` | `0` | `1` re-enables Qwen3.5’s reasoning phase (adds latency) |
-| `IRIS_TIMEOUT_CONNECT` / `IRIS_TIMEOUT_READ` | `5.0` / `180.0` | HTTP timeouts (seconds) |
-| `IRIS_HISTORY_TURNS` | `24` | max messages after trim |
-| `IRIS_HISTORY_CHARS` | `24000` | max total characters after trim |
-| `IRIS_TRIM_HISTORY` | `1` | set `0` to disable trimming |
-| `IRIS_RETRY_CONNECT` | `1` | bounded retries on connection refusal |
-| `IRIS_STREAM_USAGE` | `0` | `1` requests token usage in the stream (needs a supporting build) |
+| `ULTRON_ENABLE_THINKING` | `0` | `1` re-enables Qwen3.5’s reasoning phase (adds latency) |
+| `ULTRON_TIMEOUT_CONNECT` / `ULTRON_TIMEOUT_READ` | `5.0` / `180.0` | HTTP timeouts (seconds) |
+| `ULTRON_HISTORY_TURNS` | `24` | max messages after trim |
+| `ULTRON_HISTORY_CHARS` | `24000` | max total characters after trim |
+| `ULTRON_TRIM_HISTORY` | `1` | set `0` to disable trimming |
+| `ULTRON_RETRY_CONNECT` | `1` | bounded retries on connection refusal |
+| `ULTRON_STREAM_USAGE` | `0` | `1` requests token usage in the stream (needs a supporting build) |
+| `MEMORY_PROXY_TOOLS` | `1` | forward client tool schemas through the proxy |
+| `MEMORY_PROXY_KEEP_CLIENT_SYSTEM` | `0` | keep the UI system prompt after the ULTRON persona |
+| `MEMORY_PROXY_UI_PERSONA` | `1` | use the UI persona; `0` uses the voice persona |
 
 ### Voice
 
@@ -598,7 +614,7 @@ All values come from `.env` or the process environment (via `iris_config.load_do
 | `CRAG_SEARCH_EF` | `64` | HNSW `search_ef` |
 | `CRAG_HYBRID_RETRIEVAL` | `1` | dense + BM25 RRF fusion |
 | `CRAG_QUERY_ROUTER` | `1` | adaptive simple / memory / standard routing |
-| `IRIS_TEMPORAL_DB` | `iris_memory/temporal_memory.db` | episodic store override |
+| `ULTRON_TEMPORAL_DB` | `ultron_memory/temporal_memory.db` | episodic store override |
 
 ---
 
@@ -606,7 +622,7 @@ All values come from `.env` or the process environment (via `iris_config.load_do
 
 | Suite | Requires | Expected |
 |---|---|---|
-| `python selftest.py` | nothing | **154 / 154 PASS** (offline) |
+| `python selftest.py` | nothing | **166 / 166 PASS** (offline) |
 | `python test_streaming.py` | nothing | **49 / 49 PASS** in <1 s (real-socket test binds a local port) |
 | `python test_integration.py` | `llama-server` (+ voice deps for section 9) | each section prints `PASS` / `FAIL` / `SKIP (reason)` |
 | `python download_models.py --check` | nothing | JSON status: `stt_snapshot_complete`, `deps_missing`, `env_keys` |
@@ -686,7 +702,7 @@ An `rtf` around 0.08–0.1 on a 4050 Max-Q means Kokoro is generating ~10× fast
 | `InvalidVoiceError` | voice name not in the pack | `tts_engine` retries once with `af_heart`; set a valid `TTS_VOICE` |
 | `wait_idle timed out` | wedged audio device | bounded to 120 s, then a warning — the turn continues |
 | `malformed tool arguments` in trace | model emitted broken JSON | tool not executed; the model receives an error tool message and can retry |
-| Empty answers with only reasoning | `IRIS_ENABLE_THINKING=1` consumed the token budget | unset it (default `0`) |
+| Empty answers with only reasoning | `ULTRON_ENABLE_THINKING=1` consumed the token budget | unset it (default `0`) |
 | `python test_integration.py` shows 9 SKIPs | server not up, TTS not installed | expected on a fresh clone; see §10 |
 | Keyless Tavily rate-limited | no `TAVILY_API_KEY` | get a free key, add to `.env` |
 
@@ -715,7 +731,7 @@ These are properties the code is written to preserve, and each one has a test in
 
 ## 16. Related repositories
 
-- **[`hacktivist211/modern-crag`](https://github.com/hacktivist211/modern-crag)** — the CRAG pipeline as a standalone CLI, with a CRAG-only `requirements.txt`. Shares `iris_config.py`, `tool_runtime.py`, `temporal_memory.py`, `evaluator_router.py`, `generator.py`, `retrieval.py`, `main.py`, `tavily_tool.py`, `memory_store.py`, `memory_import.py` byte-for-byte with this repo. Run CRAG research from `modern-crag` and voice from `` — both share the same `llama-server`.
+- **[`hacktivist211/modern-crag`](https://github.com/hacktivist211/modern-crag)** — the CRAG pipeline as a standalone CLI, with a CRAG-only `requirements.txt`. Shares `ultron_config.py`, `tool_runtime.py`, `temporal_memory.py`, `evaluator_router.py`, `generator.py`, `retrieval.py`, `main.py`, `tavily_tool.py`, `memory_store.py`, `memory_import.py` byte-for-byte with this repo. Run CRAG research from `modern-crag` and voice from `` — both share the same `llama-server`.
 
 ## License
 

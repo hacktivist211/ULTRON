@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Long-term memory for IRIS.
+"""Long-term memory for ULTRON.
 
 Storage: a single flat SQLite file (memory.db) beside this module. No server,
 no extra VRAM. Embeddings come from your llama-server
@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import requests
 
-import iris_config as cfg
+import ultron_config as cfg
 
 # Shared lazy sentence-transformers model for the optional sbert backend.
 _SBERT = None
@@ -56,7 +56,7 @@ MEMORY_SEARCH_SCHEMA = {
         "name": "memory_search",
         "description": (
             "Search the user's long-term memory (facts, preferences, past conversations "
-            "imported from ChatGPT, Claude, Gemini, and IRIS itself). Use this before "
+            "imported from ChatGPT, Claude, Gemini, and ULTRON itself). Use this before "
             "answering personal questions or when the user refers to something discussed before."
         ),
         "parameters": {

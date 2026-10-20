@@ -1,4 +1,4 @@
-# IRIS Audit Report — Full Code Audit, Integration Repair, Hardware-Specific Optimization
+# ULTRON Audit Report — Full Code Audit, Integration Repair, Hardware-Specific Optimization
 
 Scope: the 16 files you listed, inspected line-by-line before any edit.
 Verification philosophy: only claims backed by tests **executed on the build
@@ -36,11 +36,11 @@ risk), M=medium (correctness edge), L=low (hygiene).
 | 3 | Malformed tool-call JSON silently executed with `args={}` | C | `tool_runtime.chat()` — `except JSONDecodeError: args = {}` | validation gap | arguments must parse to a JSON object or the tool is NOT executed; model receives a `malformed tool arguments` error message and can reissue | "malformed tool args never executed" + integration fake roundtrip | **VERIFIED** |
 | 4 | Reasoning leakage risk: Qwen thinking (`reasoning_content` / think tags) could be spoken by TTS | C | `tool_runtime.py` — no handling at all | Qwen3.5 emits reasoning on many prompts | `reasoning_content` deltas typed separately and dropped; streaming `ThinkFilter` state machine removes think blocks across arbitrary delta splits | ThinkFilter split tests + reasoning suppression checks | **VERIFIED** |
 | 5 | Two competing model stacks on one 6 GB GPU | C | `generator.py` / `evaluator_router.py` — hard `from langchain_ollama import ChatOllama` (granite4.2:3b + gemma4:e4b via Ollama); `retrieval.py` bge-m3 default GPU | CRAG predated the llama-server decision | `CRAG_BACKEND=llamaserver` default: every CRAG LLM call goes to your llama-server (temperature 0 control / 0.7 generation); Ollama+langchain imports now lazy and opt-in; bge-m3 defaults to CPU; startup health warning; CRAG never starts any model service | crag_smoke 37/37: backend routing, control-plane parsing, import hygiene (`langchain_ollama` never imported), dead-backend degradation | **VERIFIED** for plumbing; live quality needs `python main.py` on your machine |
-| 6 | Two unrelated databases both named `memory.db` (personal vs episodic) + CWD-relative risk | H | `temporal_memory.py` — `iris_memory/memory.db`; `memory_store.py` — `memory.db` | organic growth, no store map | episodic store renamed `iris_memory/temporal_memory.db` with **non-destructive auto-migration** (legacy copied, original kept); `IRIS_TEMPORAL_DB` override; memory map documented in `iris_config.py` and INTEGRATION.md | migration + reopen + lifecycle checks (crag_smoke) | **VERIFIED** |
+| 6 | Two unrelated databases both named `memory.db` (personal vs episodic) + CWD-relative risk | H | `temporal_memory.py` — `ultron_memory/memory.db`; `memory_store.py` — `memory.db` | organic growth, no store map | episodic store renamed `ultron_memory/temporal_memory.db` with **non-destructive auto-migration** (legacy copied, original kept); `ULTRON_TEMPORAL_DB` override; memory map documented in `ultron_config.py` and INTEGRATION.md | migration + reopen + lifecycle checks (crag_smoke) | **VERIFIED** |
 | 7 | Embedding quality assumed, never measured; dimension mismatches unguarded | H | `memory_store.py` — no validation; self-tests used a fake embedder | OpenAI-compatible endpoint ≠ useful embeddings | `bench_retrieval.py` (labeled queries: exact/paraphrase/date/distractor/unrelated; Recall@1/3/5 + MRR + calibration score); optional `EMBED_BACKEND=sbert` comparison; dimension guard: first embed fixes dim, mismatches raise (embed) or skip-with-warning (stored vectors) | `--fake` metric machinery executed; real quality REQUIRES RUNTIME (`python bench_retrieval.py`) | machinery **VERIFIED**; quality numbers pending your run |
 | 8 | Web-search grounding was prompt-thin; empty results could be hallucinated over | H | `tavily_tool.py` + `tool_runtime` prompt | no evidence contract | bounded evidence payload (title/url/snippet preserved), `empty` flag + explicit guidance ("could not verify" instead of guessing), SEARCH GROUNDING system-prompt section, `answer` labeled as search-engine synthesis not a source | tavily edge tests + payload bound checks (selftest 67/67) | **VERIFIED** (offline shapes); live grounding judgement REQUIRES RUNTIME |
 | 9 | Voice pipeline: duplicate model loads possible, no latency metrics, hard failures | H | `voice_cache.py` | no lifecycle owner | `get_tts()` singleton (Kokoro-82M via pykokoro, official `kokoro` fallback, version-tolerant), returns `None` on failure → text-only degradation; `timed_synthesis()` + `VoiceMetrics` (TTFA, synth ms, audio s, RTF); empty-input guard in `synth()` | static compile + interface checks (no torch here) | REQUIRES RUNTIME (voice section of `test_integration.py`) |
-| 10 | Conversation history unbounded | H | `tool_runtime.chat()` — caller-managed only | no policy | `trim_history()`: keep leading system messages + newest messages within `IRIS_HISTORY_TURNS` (24) / `IRIS_HISTORY_CHARS` (24000); tool messages never orphaned from their assistant owner | trim tests incl. orphan case | **VERIFIED** |
+| 10 | Conversation history unbounded | H | `tool_runtime.chat()` — caller-managed only | no policy | `trim_history()`: keep leading system messages + newest messages within `ULTRON_HISTORY_TURNS` (24) / `ULTRON_HISTORY_CHARS` (24000); tool messages never orphaned from their assistant owner | trim tests incl. orphan case | **VERIFIED** |
 | 11 | `start_llama.sh` was fire-and-forget: no health wait, no error reporting, no clean shutdown | H | `start_llama.sh` | minimal script | pre-flight (binary, port, free VRAM, `--embeddings` support probe), bounded `/health` wait with READY + endpoints, early-exit diagnostics, `trap` for INT/TERM, env tunables; server command itself stays byte-identical to yours (+`--embeddings`) | `bash -n` + logic review; live behavior REQUIRES RUNTIME | static **VERIFIED**; live REQUIRES RUNTIME |
 | 12 | Connect failures gave raw tracebacks; no retry policy | M | `tool_runtime.chat()` | no wrapper | `LlamaServerError` with actionable messages ("Is ./start_llama.sh running?"), one bounded connection retry, mid-stream failure returns partial text + honest trace entry, empty response raises | empty-stream and mid-stream failure tests | **VERIFIED** |
 | 13 | CRAG `release_gpu()` message referenced Ollama; banner claimed GPU fp16 embeddings | L | `retrieval.py`, `main.py` | stale text | messages/banner corrected; CPU default documented | grep + smoke banner | **VERIFIED** |
@@ -69,7 +69,7 @@ outstanding beyond the REQUIRES RUNTIME items above.
    │    filler playback   │    │ retrieval.py (Chroma + bge-m3│
    │ tools: web_search,   │    │   on CPU by default)         │
    │  memory_search/add   │    │ temporal_memory.py (episodic │
-   └───┬──────────┬──────┘    │   iris_memory/temporal.db)   │
+   └───┬──────────┬──────┘    │   ultron_memory/temporal.db)   │
        │          │           └──────────────────────────────┘
   Tavily    memory.db  (durable personal memory, embeddings via
   (HTTP)    the same llama-server /v1/embeddings)
@@ -84,7 +84,7 @@ outstanding beyond the REQUIRES RUNTIME items above.
 - **Single inference runtime**: llama-server. CRAG is a client, not a stack:
   with the default `CRAG_BACKEND=llamaserver` it holds no model weights and
   cannot load anything onto the GPU. Ollama exists only behind an explicit
-  opt-in env var and is never started by any IRIS code.
+  opt-in env var and is never started by any ULTRON code.
 - **Tool dispatch**: `chat()` merges streamed tool-call fragments, validates
   JSON, executes via `execute_tool()` (web_search / memory_search /
   memory_add), appends tool messages with matching ids, loops at most
@@ -125,7 +125,7 @@ outstanding beyond the REQUIRES RUNTIME items above.
 ### Files modified
 `tool_runtime.py` (streaming core rewritten; public `chat()` signature
 preserved — `on_delta`/`on_tool_start`/`on_tool_end`/`(text, trace)` return
-unchanged), `iris_config.py`, `memory_store.py`, `tavily_tool.py`,
+unchanged), `ultron_config.py`, `memory_store.py`, `tavily_tool.py`,
 `voice_cache.py`, `start_llama.sh`, `generator.py`, `evaluator_router.py`,
 `retrieval.py`, `temporal_memory.py`, `main.py`, `selftest.py` (expanded,
 all 50 prior checks retained), `INTEGRATION.md`, `README.md`.
@@ -133,8 +133,8 @@ all 50 prior checks retained), `INTEGRATION.md`, `README.md`.
 ### Files added
 `test_streaming.py`, `test_integration.py`, `bench_retrieval.py`,
 `bench_first_token.py`, `monitor_gpu.sh`, `AUDIT_REPORT.md`.
-(CRAG files consolidated flat next to the IRIS files, matching your
-`~/Documents/IRIS` layout; the `iris-crag/` staging directory is gone.)
+(CRAG files consolidated flat next to the ULTRON files, matching your
+`~/Documents/ULTRON` layout; the `ultron-crag/` staging directory is gone.)
 
 ### Tests: executed vs not
 - Executed here, all green: selftest 67/67, test_streaming 49/49,
@@ -155,7 +155,7 @@ all 50 prior checks retained), `INTEGRATION.md`, `README.md`.
    try `--pooling mean` or the sbert backend (both one-line changes).
 
 ### Actions you must perform manually
-1. Copy the flat files to `~/Documents/IRIS` (overwrite the old ones).
+1. Copy the flat files to `~/Documents/ULTRON` (overwrite the old ones).
 2. `./start_llama.sh` — the new wrapper (your flags unchanged).
 3. First CRAG run: nothing to do — the episodic DB migrates itself.
 4. Run `python selftest.py`, `python test_streaming.py`,

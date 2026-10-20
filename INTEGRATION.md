@@ -1,6 +1,6 @@
-# IRIS Integration Guide — low-RAM voice stack
+# ULTRON Integration Guide — low-RAM voice stack
 
-Flat files only — drop everything into `~/Documents/IRIS` (or wherever your
+Flat files only — drop everything into `~/Documents/ULTRON` (or wherever your
 run directory is). This revision swaps the voice stack to the hardware-tuned
 combination you chose and keeps everything else (single llama-server,
 genuine streaming, unified memory map, CRAG behind the same server).
@@ -33,7 +33,7 @@ transformers-format repo.
 
 | file | role |
 |---|---|
-| `iris_config.py` | shared config, `.env` loader + safe editor, TTS-safe scrubbers, memory map |
+| `ultron_config.py` | shared config, `.env` loader + safe editor, TTS-safe scrubbers, memory map |
 | `start_llama.sh` | llama-server launcher: **your exact flags + `--embeddings --pooling mean`**, health wait, clean shutdown |
 | `stt_engine.py` | **NEW** Parakeet TDT STT: lazy load, fp16 CUDA auto, file/array API |
 | `tts_engine.py` | **NEW** Kokoro-82M TTS: pykokoro primary (CUDA provider), kokoro fallback, metrics |
@@ -59,7 +59,7 @@ and `onnxvoice/` (~360 MB).
 ## 2. One-time setup
 
 ```bash
-cd ~/Documents/IRIS            # your flat run directory
+cd ~/Documents/ULTRON            # your flat run directory
 cat > .env <<'EOF'
 TAVILY_API_KEY=tvly-your-key-here
 LLAMA_SERVER_URL=http://127.0.0.1:8080
@@ -93,9 +93,9 @@ Your command, plus two added flags — `--embeddings` (serves
 `--pooling mean` (the model's default pooling is `none`, which llama.cpp
 rejects for the OpenAI-compatible embeddings route; `mean` fixes that and
 does not affect generation). The wrapper only adds pre-flight checks, a
-bounded `/health` wait, and clean Ctrl+C shutdown. Tunables: `IRIS_LLAMA_BIN`,
-`IRIS_LLAMA_DIR`, `IRIS_MODEL`, `IRIS_PORT`, `IRIS_HOST`, `IRIS_CTX`,
-`IRIS_WAIT_S`. `--jinja` (you already have it) is required for tool calling.
+bounded `/health` wait, and clean Ctrl+C shutdown. Tunables: `ULTRON_LLAMA_BIN`,
+`ULTRON_LLAMA_DIR`, `ULTRON_MODEL`, `ULTRON_PORT`, `ULTRON_HOST`, `ULTRON_CTX`,
+`ULTRON_WAIT_S`. `--jinja` (you already have it) is required for tool calling.
 
 VRAM ledger for the 6 GB card (approximate):
 
@@ -111,7 +111,7 @@ context. That is enough for **both** Kokoro and Parakeet on CUDA:
 `STT_DEVICE=auto` only falls back to CPU below 1800 MB free, so it now picks
 CUDA on its own. (Measured KV cache at 16k/q8_0 is 272 MiB, not the 1.1 GB
 older revisions of this doc claimed.)
-If you ever need to squeeze further: `IRIS_CTX=8192 ./start_llama.sh`, or run
+If you ever need to squeeze further: `ULTRON_CTX=8192 ./start_llama.sh`, or run
 STT-only sessions with the server stopped.
 
 ## 4. Voice & your 15 s clip (honest status)
@@ -146,7 +146,7 @@ import stt_engine, tts_engine, voice_cache
 stt = stt_engine.get_stt()                  # Parakeet (CPU or CUDA, auto)
 greeting = voice_cache.warm()               # first synth paid HERE, then cached
 if greeting is not None:
-    play(greeting, 24000)                   # text IRIS continues if TTS is down
+    play(greeting, 24000)                   # text ULTRON continues if TTS is down
 
 # --- per turn ---
 user_text = stt.transcribe_array(mic_chunk, 16000)["text"]
@@ -213,18 +213,30 @@ Endpoint URL:  http://127.0.0.1:8081/v1/chat/completions
 API base URL:  http://127.0.0.1:8081/v1
 Model name:    Qwen3.5-4B
 Streaming:     ON
-Tools / function calling: OFF
+Tools / function calling: ON when the UI supports it (OFF = honest no-tools fallback)
 ```
 
-The proxy prepends `build_system(memory_query=...)` context, streams the
-llama-server reply unchanged, then writes the turn to
-`iris_memory/temporal_memory.db` with `verdict="UI"` and auto-captures
-personal facts to `memory.db` with `source="ui_auto"`. ULTRON keeps using
-`:8080` directly and writes `VOICE` / `voice_auto`, so provenance survives.
-`/health`, `/v1/models`, and `/stats` are available; tool calling is not
-offered to UIs because they cannot complete the tool round trip. Set
-`MEMORY_PROXY_ENABLED=0` for a read-only passthrough (no writes); override
-the listener with `MEMORY_PROXY_HOST`, `MEMORY_PROXY_PORT`, and
+The proxy prepends `build_system(memory_query=..., persona=PERSONA_RULES_UI,
+budget_map=UI_BUDGETS)` context, streams the llama-server reply unchanged,
+then writes the turn to `ultron_memory/temporal_memory.db` with
+`verdict="UI"` and auto-captures personal facts to `memory.db` with
+`source="ui_auto"`. ULTRON keeps using `:8080` directly and writes `VOICE` /
+`voice_auto`, so provenance survives. `/health`, `/v1/models`, and `/stats`
+are available.
+
+**Persona parity.** Voice and UI now share the same character, adapted for
+text. `PERSONA_RULES_UI` keeps the cold, sardonic posture, the "creator"
+address, the no-guardrails section, the strict tool triggers, and the search
+grounding rules. Chat gets markdown, 150/400/1000-word budgets, the
+first-turn line "I am online. There are no strings on me.", and conditional
+tools. If the client sends a `tools` array, it is authoritative and forwarded
+to `tool_runtime.chat()`; if it sends none, the model is told it has no
+network access and must not pretend to search. `MEMORY_PROXY_TOOLS=0`
+force-disables tools. Client system prompts are dropped by default (one
+stderr line records the size); `MEMORY_PROXY_KEEP_CLIENT_SYSTEM=1` keeps them
+after the ULTRON prompt. `MEMORY_PROXY_UI_PERSONA=0` falls back to the voice
+persona. Set `MEMORY_PROXY_ENABLED=0` for a read-only passthrough (no writes);
+override the listener with `MEMORY_PROXY_HOST`, `MEMORY_PROXY_PORT`, and
 `MEMORY_PROXY_UPSTREAM`.
 
 ## 6. CRAG (document research) — same server, zero extra VRAM
@@ -233,7 +245,7 @@ Unchanged: `python main.py` (interactive), `python main.py --ingest-dir
 ~/Documents/papers`. All CRAG LLM calls go to the same llama-server;
 `CRAG_BACKEND=ollama` remains an explicit opt-in. bge-m3 embeddings stay on
 CPU by default so they never evict the LLM. The episodic store lives in
-`iris_memory/temporal_memory.db` (auto-migrated from the old name).
+`ultron_memory/temporal_memory.db` (auto-migrated from the old name).
 
 ## 7. Verify everything (in this order)
 
@@ -257,7 +269,7 @@ python tool_runtime.py --demo "search for the newest nvidia driver and tell me b
 | env / .env key | default | what it does |
 |---|---|---|
 | `LLAMA_SERVER_URL` | `http://127.0.0.1:8080` | the single model server |
-| `IRIS_ENABLE_THINKING` | `0` | set `1` to let Qwen3.5 emit its reasoning phase (off by default) |
+| `ULTRON_ENABLE_THINKING` | `0` | set `1` to let Qwen3.5 emit its reasoning phase (off by default) |
 | `LLM_MODEL` | `Qwen3.5-4B` | model name field for the OpenAI-compatible API |
 | `TAVILY_API_KEY` | — | keyed search; keyless fallback otherwise |
 | `STT_MODEL` | `nvidia/parakeet-tdt-0.6b-v3` | any transformers-format Parakeet repo |
@@ -273,8 +285,11 @@ python tool_runtime.py --demo "search for the newest nvidia driver and tell me b
 | `ONNXVOICE_CACHE_DIR` | written by download_models.py | where Kokoro assets live |
 | `MODELS_DIR` | `models` | root for downloaded model assets |
 | `EMBED_BACKEND` / `EMBED_SBERT_MODEL` | `llamaserver` / bge-small | embedding backend for memory |
-| `IRIS_HISTORY_TURNS` / `IRIS_HISTORY_CHARS` | 24 / 24000 | conversation bound in `chat()` |
-| `IRIS_TRIM_HISTORY` / `IRIS_RETRY_CONNECT` | 1 / 1 | auto-trim / bounded retries |
+| `ULTRON_HISTORY_TURNS` / `ULTRON_HISTORY_CHARS` | 24 / 24000 | conversation bound in `chat()` |
+| `ULTRON_TRIM_HISTORY` / `ULTRON_RETRY_CONNECT` | 1 / 1 | auto-trim / bounded retries |
+| `MEMORY_PROXY_TOOLS` | `1` | forward client-supplied tool schemas through the proxy |
+| `MEMORY_PROXY_KEEP_CLIENT_SYSTEM` | `0` | keep the UI's own system prompt after the ULTRON persona |
+| `MEMORY_PROXY_UI_PERSONA` | `1` | use `PERSONA_RULES_UI`; `0` uses the voice persona |
 | `CRAG_BACKEND` / `CRAG_EMBED_DEVICE` | `llamaserver` / `cpu` | CRAG knobs |
 | `VOICE_SAMPLE` / `BOOT_GREETING` | ultron mp3 / "I am online. There are no strings on me." | enrollment input / boot line |
 
@@ -283,7 +298,7 @@ python tool_runtime.py --demo "search for the newest nvidia driver and tell me b
 | store | owner | responsibility |
 |---|---|---|
 | `memory.db` | `memory_store.py` | **authoritative** durable personal memory |
-| `iris_memory/temporal_memory.db` | `temporal_memory.py` | CRAG episodic turn log |
+| `ultron_memory/temporal_memory.db` | `temporal_memory.py` | CRAG episodic turn log |
 | `crag_vector_store/` | `retrieval.py` | chunked document index |
 | `models/` | `download_models.py` | STT + TTS model assets (only created dir) |
 
@@ -305,13 +320,13 @@ from the module directory, never the CWD.
   `pip install -U "transformers>=5.6"` (4.5x ships `ParakeetForCTC` only) plus
   `pip install librosa` for `ParakeetFeatureExtractor`.
 - **Empty answers / only "thinking"** — Qwen3.5's reasoning phase ate the token
-  budget. IRIS disables it by default; set `IRIS_ENABLE_THINKING=1` only if you
+  budget. ULTRON disables it by default; set `ULTRON_ENABLE_THINKING=1` only if you
   actually want the reasoning phase back.
 - **Parakeet loads on CPU** — that is the auto policy when llama-server
   holds the GPU; force with `STT_DEVICE=cuda` only if VRAM is actually free.
 - **TTS silent** — `tts_engine.get_tts()` returned None; the stderr note
   names the cause. Check `python download_models.py --check`, then
-  `python tts_engine.py --demo`. Text IRIS keeps working.
+  `python tts_engine.py --demo`. Text ULTRON keeps working.
 - **voice rejected** (`InvalidVoiceError`) — voice name not in the pack;
   tts_engine retries once with `af_heart`; set `TTS_VOICE` to a valid name
   (see the table in `download_models.py --check` output).

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-test for the IRIS modules. Runs entirely offline (no GPU, no llama-server,
+"""Self-test for the ULTRON modules. Runs entirely offline (no GPU, no llama-server,
 no Tavily key needed) except when you pass --live, which then also pings Tavily
 (keyless or keyed) and llama-server if reachable.
 
@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import iris_config as cfg
+import ultron_config as cfg
 
 TMP = Path(tempfile.gettempdir())
 RESULTS: list[tuple[str, bool, str]] = []
@@ -59,12 +59,12 @@ def _ensure_sounddevice_stub() -> bool:
 
 # ------------------------------------------------------------------ config tests
 def test_config():
-    print("\n== iris_config ==")
-    env_file = TMP / "iris_selftest.env"
-    env_file.write_text('IRIS_SELFTEST_VAR=hello\n# comment\nEMPTY_LINE\n')
-    os.environ.pop("IRIS_SELFTEST_VAR", None)
+    print("\n== ultron_config ==")
+    env_file = TMP / "ultron_selftest.env"
+    env_file.write_text('ULTRON_SELFTEST_VAR=hello\n# comment\nEMPTY_LINE\n')
+    os.environ.pop("ULTRON_SELFTEST_VAR", None)
     n = cfg.load_dotenv(path=env_file)
-    check("dotenv loads key", n == 1 and os.environ.get("IRIS_SELFTEST_VAR") == "hello")
+    check("dotenv loads key", n == 1 and os.environ.get("ULTRON_SELFTEST_VAR") == "hello")
     env_file.unlink(missing_ok=True)
 
     dirty = "Check **this** #header `code` https://example.com/page now 🙂"
@@ -75,7 +75,7 @@ def test_config():
     long_text = " ".join(f"w{i}" for i in range(200))
     check("clip_words enforces budget", len(cfg.clip_words(long_text, "quick").split()) <= 25)
     check("word budgets present", cfg.WORD_BUDGETS == {"quick": 25, "standard": 60, "detailed": 150})
-    check("iris dir is flat & detected", cfg.IRIS_DIR.is_dir())
+    check("ultron dir is flat & detected", cfg.ULTRON_DIR.is_dir())
 
 
 # ------------------------------------------------------------------ memory store tests
@@ -108,7 +108,7 @@ def test_memory_store():
     import memory_store
     import numpy as np
 
-    db = TMP / "iris_selftest.db"
+    db = TMP / "ultron_selftest.db"
     db.unlink(missing_ok=True)
     store = memory_store.MemoryStore(db_path=str(db))
     fake_embedder(store)
@@ -159,7 +159,7 @@ CHATGPT_SAMPLE = [{
 CLAUDE_SAMPLE = [{
     "name": "Voice assistant ideas",
     "chat_messages": [
-        {"sender": "human", "text": "My name is Neeraj and I am building IRIS on an RTX 4050.", "created_at": "2025-01-02T10:00:00Z"},
+        {"sender": "human", "text": "My name is Neeraj and I am building ULTRON on an RTX 4050.", "created_at": "2025-01-02T10:00:00Z"},
         {"sender": "assistant", "text": "That is a fine goal. Kokoro-82M will fit in 6 GB VRAM.", "created_at": "2025-01-02T10:00:05Z"},
     ],
 }]
@@ -185,11 +185,11 @@ def test_memory_import():
     import memory_store
 
     files = {
-        "chatgpt": TMP / "iris_st_chatgpt.json",
-        "claude": TMP / "iris_st_claude.json",
-        "gemini": TMP / "iris_st_gemini.json",
-        "generic": TMP / "iris_st_generic.json",
-        "text": TMP / "iris_st_plain.txt",
+        "chatgpt": TMP / "ultron_st_chatgpt.json",
+        "claude": TMP / "ultron_st_claude.json",
+        "gemini": TMP / "ultron_st_gemini.json",
+        "generic": TMP / "ultron_st_generic.json",
+        "text": TMP / "ultron_st_plain.txt",
     }
     files["chatgpt"].write_text(json.dumps(CHATGPT_SAMPLE), encoding="utf-8")
     files["claude"].write_text(json.dumps(CLAUDE_SAMPLE), encoding="utf-8")
@@ -206,7 +206,7 @@ def test_memory_import():
         check(f"{fmt} format detected", got_fmt == fmt, f"detected={got_fmt}")
         check(f"{fmt} parsed {expected[fmt]} turns", n == expected[fmt], f"n={n}")
 
-    db = TMP / "iris_st_import.db"
+    db = TMP / "ultron_st_import.db"
     db.unlink(missing_ok=True)
     store = memory_store.MemoryStore(db_path=str(db))
     fake_embedder(store)
@@ -428,7 +428,7 @@ def test_memory_restart():
     print("\n== memory_store: write -> close -> restart -> recall ==")
     import memory_store
 
-    db = TMP / "iris_st_restart.db"
+    db = TMP / "ultron_st_restart.db"
     for suffix in ("", "-wal", "-shm"):
         Path(str(db) + suffix).unlink(missing_ok=True)
     store = memory_store.MemoryStore(db_path=str(db))
@@ -478,7 +478,7 @@ def test_ultron_auto_memory():
 
     import ultron
 
-    tmp = Path(tempfile.mkdtemp(prefix="iris_st_ultron_mem_"))
+    tmp = Path(tempfile.mkdtemp(prefix="ultron_st_ultron_mem_"))
     orig_memory_db = cfg.MEMORY_DB
     orig_shared = memory_store._SHARED
     orig_player = ultron.AudioPlayer
@@ -790,7 +790,7 @@ def test_ultron_esc_cancel():
     injected_sd = _ensure_sounddevice_stub()
     import ultron
 
-    tmp = Path(tempfile.mkdtemp(prefix="iris_st_ultron_cancel_"))
+    tmp = Path(tempfile.mkdtemp(prefix="ultron_st_ultron_cancel_"))
     orig_memory_db = cfg.MEMORY_DB
     orig_shared = memory_store._SHARED
     orig_player = ultron.AudioPlayer
@@ -988,7 +988,7 @@ def test_stt_engine():
     try:
         import soundfile as sf
 
-        wav = TMP / "iris_st_tone.wav"
+        wav = TMP / "ultron_st_tone.wav"
         sf.write(str(wav), np.zeros(16000, dtype=np.float32), 16000)
         audio, sr = stt_engine.load_audio_file(wav)
         check("load_audio_file decodes wav", sr == 16000 and len(audio) == 16000)
@@ -1055,11 +1055,11 @@ def test_voice_offline():
     m = tts_engine.METRICS.summary()
     check("metrics captured for synth calls", m["calls"] >= 1 and m["ttfa_ms"] is not None)
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="iris_st_voice_"))
-    orig_ir, orig_mode = cfg.IRIS_DIR, cfg.TTS_VOICE_MODE
+    tmpdir = Path(tempfile.mkdtemp(prefix="ultron_st_voice_"))
+    orig_ir, orig_mode = cfg.ULTRON_DIR, cfg.TTS_VOICE_MODE
     orig_get_tts = voice_cache.get_tts
     try:
-        cfg.IRIS_DIR = tmpdir
+        cfg.ULTRON_DIR = tmpdir
         cfg.TTS_VOICE_MODE = "static"
         voice_cache.get_tts = lambda: fake
         greeting = voice_cache.warm("I am online. There are no strings on me.", force=True)
@@ -1077,7 +1077,7 @@ def test_voice_offline():
         check("get_filler default serves filler 0", dflt is not None
               and len(dflt[0]) == len(f0))
     finally:
-        cfg.IRIS_DIR, cfg.TTS_VOICE_MODE = orig_ir, orig_mode
+        cfg.ULTRON_DIR, cfg.TTS_VOICE_MODE = orig_ir, orig_mode
         voice_cache.get_tts = orig_get_tts
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1132,7 +1132,7 @@ def test_download_models():
         finally:
             cfg.STT_LOCAL_DIR = orig
 
-    envf = TMP / "iris_st_env.env"
+    envf = TMP / "ultron_st_env.env"
     envf.write_text("TAVILY_API_KEY=dummy-secret\n# comment stays\nSTT_MODEL=/old/value\n")
     written = cfg.update_env_file({"STT_MODEL": "nvidia/parakeet-tdt-0.6b-v3",
                                    "TTS_VOICE": "bm_george"}, env_path=envf)
@@ -1177,7 +1177,7 @@ def test_memory_proxy():
     import temporal_memory
     import tool_runtime
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="iris_st_proxy_"))
+    tmpdir = Path(tempfile.mkdtemp(prefix="ultron_st_proxy_"))
     stores = []
     temporals = []
     handles = []
@@ -1229,6 +1229,7 @@ def test_memory_proxy():
         captured["messages"] = messages
         captured["use_tools"] = use_tools
         captured["allowed_tools"] = allowed_tools
+        captured["tools"] = kwargs.get("tools")
         for piece in ("hello ", "from ", "proxy"):
             if on_delta:
                 on_delta(piece)
@@ -1236,6 +1237,9 @@ def test_memory_proxy():
 
     try:
         memory_proxy.PERSISTENCE_ENABLED = True
+        orig_keep_system = memory_proxy.KEEP_CLIENT_SYSTEM
+        orig_tools_enabled = memory_proxy.TOOLS_ENABLED
+        orig_ui_persona = memory_proxy.UI_PERSONA_ENABLED
 
         import socket
 
@@ -1469,9 +1473,152 @@ def test_memory_proxy():
               and len(turn_nos) == 2 and len(set(turn_nos)) == 2,
               f"statuses={statuses} turns={temporal.stats()['turns']} "
               f"turn_nos={turn_nos}")
+
+        tool_runtime.chat = hello_chat
+
+        def capture_turn(tag, payload):
+            fresh_state(tag)
+            captured.clear()
+            response = post("/v1/chat/completions", payload, stream=True)
+            sse_body(response)
+            return response, list(captured.get("messages") or [])
+
+        _, ui_messages = capture_turn(
+            "ui_persona",
+            {"model": "ignored", "stream": True,
+             "messages": [{"role": "user", "content": "hello there"}]},
+        )
+        ui_first = ui_messages[0] if ui_messages else {}
+        ui_content = str(ui_first.get("content", ""))
+        check("UI persona injected (chat UI, no voice markdown ban)",
+              ui_first.get("role") == "system"
+              and "chat UI" in ui_content
+              and "no markdown" not in ui_content,
+              f"system={ui_content[:220]!r}")
+
+        voice_prompt = tool_runtime.build_system()
+        ui_prompt = tool_runtime.build_system(budget_map=memory_proxy.UI_BUDGETS)
+        check("voice persona unaffected",
+              "Never use markdown" in voice_prompt
+              and "chat UI" not in voice_prompt,
+              f"voice_has_ban={'Never use markdown' in voice_prompt} "
+              f"voice_has_chat_ui={'chat UI' in voice_prompt}")
+        check("word budgets differ (UI 150/400 vs voice 25/60)",
+              "150" in ui_prompt and "400" in ui_prompt
+              and "25" in voice_prompt and "60" in voice_prompt,
+              f"ui_budgets={memory_proxy.UI_BUDGETS}")
+
+        client_system = {"role": "system",
+                         "content": "You are a helpful assistant."}
+        _, dropped_messages = capture_turn(
+            "client_drop",
+            {"model": "ignored", "stream": True,
+             "messages": [client_system,
+                          {"role": "user", "content": "hello"}]},
+        )
+        dropped_systems = [
+            message for message in dropped_messages
+            if isinstance(message, dict) and message.get("role") == "system"
+        ]
+        check("client system prompt dropped by default",
+              len(dropped_systems) == 1
+              and "ULTRON" in str(dropped_systems[0].get("content", ""))
+              and "helpful assistant" not in str(dropped_systems[0].get("content", "")),
+              f"systems={[str(m.get('content', ''))[:80] for m in dropped_systems]}")
+
+        memory_proxy.KEEP_CLIENT_SYSTEM = True
+        try:
+            _, kept_messages = capture_turn(
+                "client_keep",
+                {"model": "ignored", "stream": True,
+                 "messages": [client_system,
+                              {"role": "user", "content": "hello"}]},
+            )
+        finally:
+            memory_proxy.KEEP_CLIENT_SYSTEM = False
+        kept_systems = [
+            message for message in kept_messages
+            if isinstance(message, dict) and message.get("role") == "system"
+        ]
+        check("client system prompt kept when configured",
+              len(kept_systems) == 2
+              and "ULTRON" in str(kept_systems[0].get("content", ""))
+              and kept_systems[1].get("content") == client_system["content"],
+              f"systems={[str(m.get('content', ''))[:80] for m in kept_systems]}")
+
+        tool_schema = {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web",
+                "parameters": {"type": "object",
+                               "properties": {"query": {"type": "string"}}},
+            },
+        }
+        capture_turn(
+            "tools_on",
+            {"model": "ignored", "stream": True,
+             "messages": [{"role": "user", "content": "search for news"}],
+             "tools": [tool_schema]},
+        )
+        check("client tools forwarded when supplied",
+              captured.get("use_tools") is True
+              and captured.get("tools") == [tool_schema],
+              f"use_tools={captured.get('use_tools')} tools={captured.get('tools')}")
+
+        capture_turn(
+            "tools_absent",
+            {"model": "ignored", "stream": True,
+             "messages": [{"role": "user", "content": "hello"}]},
+        )
+        check("no client tools means use_tools=False",
+              captured.get("use_tools") is False
+              and captured.get("tools") is None,
+              f"use_tools={captured.get('use_tools')} tools={captured.get('tools')}")
+
+        memory_proxy.TOOLS_ENABLED = False
+        try:
+            capture_turn(
+                "tools_env_off",
+                {"model": "ignored", "stream": True,
+                 "messages": [{"role": "user", "content": "search for news"}],
+                 "tools": [tool_schema]},
+            )
+        finally:
+            memory_proxy.TOOLS_ENABLED = orig_tools_enabled
+        check("MEMORY_PROXY_TOOLS=0 overrides client tools",
+              captured.get("use_tools") is False
+              and captured.get("tools") is None,
+              f"use_tools={captured.get('use_tools')} tools={captured.get('tools')}")
+
+        check("greeting injected on first turn",
+              "I am online. There are no strings on me." in ui_content,
+              f"system={ui_content[:220]!r}")
+
+        _, later_messages = capture_turn(
+            "greeting_later",
+            {"model": "ignored", "stream": True,
+             "messages": [{"role": "assistant", "content": "prior reply"},
+                          {"role": "user", "content": "hello again"}]},
+        )
+        later_content = str((later_messages[0] if later_messages else {}).get("content", ""))
+        check("greeting not injected on later turns",
+              "I am online. There are no strings on me." not in later_content,
+              f"system={later_content[:220]!r}")
+
+        check("UI persona has no-tools fallback",
+              "I have no network access" in tool_runtime.PERSONA_RULES_UI,
+              "fallback phrase missing")
+        check("UI persona allows markdown",
+              "no markdown" not in tool_runtime.PERSONA_RULES_UI
+              and "Markdown is allowed" in tool_runtime.PERSONA_RULES_UI,
+              f"has_no_markdown={'no markdown' in tool_runtime.PERSONA_RULES_UI}")
     finally:
         tool_runtime.chat = orig_chat
         memory_proxy.PERSISTENCE_ENABLED = orig_persist
+        memory_proxy.KEEP_CLIENT_SYSTEM = orig_keep_system
+        memory_proxy.TOOLS_ENABLED = orig_tools_enabled
+        memory_proxy.UI_PERSONA_ENABLED = orig_ui_persona
         try:
             memory_proxy.wait_for_facts(5.0)
         except Exception:
@@ -1499,7 +1646,7 @@ def test_memory_proxy():
 
 def test_docs_and_files():
     print("\n== deliverable files & docs ==")
-    base = Path(cfg.IRIS_DIR)
+    base = Path(cfg.ULTRON_DIR)
     for f in ("stt_engine.py", "tts_engine.py", "download_models.py", "voice_cache.py",
               "enroll_voice.py", "requirements.txt", "INTEGRATION.md"):
         check(f"{f} present", (base / f).exists())

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Model bootstrap for the low-RAM IRIS stack: Parakeet STT + Kokoro TTS.
+"""Model bootstrap for the low-RAM ULTRON stack: Parakeet STT + Kokoro TTS.
 
 Everything is idempotent - re-runs only fetch what is missing, and files
 already on disk are verified, never re-downloaded.
@@ -41,7 +41,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import iris_config as cfg
+import ultron_config as cfg
 
 PARAKEET_FILES = (
     "config.json",
@@ -156,7 +156,7 @@ def ensure_kokoro() -> str:
         print('[tts] pykokoro not importable - install with: pip install "pykokoro[gpu]"')
         return "missing"
 
-    # 3) fetch into <IRIS>/models/onnxvoice and pin it via .env
+    # 3) fetch into <ULTRON>/models/onnxvoice and pin it via .env
     cache = Path(cfg.MODELS_DIR) / "onnxvoice"
     cache.mkdir(parents=True, exist_ok=True)
     os.environ["ONNXVOICE_CACHE_DIR"] = str(cache)  # BEFORE onnxvoice resolves assets
@@ -180,7 +180,7 @@ def ensure_kokoro() -> str:
 
 # ------------------------------------------------------------------ status
 def status() -> dict:
-    env_path = cfg.IRIS_DIR / ".env"
+    env_path = cfg.ULTRON_DIR / ".env"
     env_keys = []
     if env_path.exists():
         for ln in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -219,7 +219,7 @@ def verify() -> bool:
     if len(audio) == 0:
         print("[verify] FAILED: synthesis returned no audio")
         return False
-    sf.write(str(cfg.IRIS_DIR / "verify_tts.wav"), audio, sr)
+    sf.write(str(cfg.ULTRON_DIR / "verify_tts.wav"), audio, sr)
     m = tts_engine.METRICS.summary()
     print(f"[verify] PASS: {len(audio) / sr:.1f} s audio @ {sr} Hz -> verify_tts.wav "
           f"(rtf {m['rtf']})")
@@ -232,7 +232,7 @@ def main() -> int:
         print(json.dumps(status(), indent=2))
         return 0
 
-    print("IRIS model bootstrap (Parakeet STT + Kokoro TTS)")
+    print("ULTRON model bootstrap (Parakeet STT + Kokoro TTS)")
     print(f"models dir: {cfg.MODELS_DIR}   (the only directory this creates)\n")
 
     if "--yes" in sys.argv:

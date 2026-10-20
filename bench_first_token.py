@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import tool_runtime as tr
-import iris_config as cfg
+import ultron_config as cfg
 
 PROMPTS = [
     "Explain how rain forms, in two sentences.",

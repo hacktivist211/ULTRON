@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ONE-TIME voice enrollment for IRIS (Kokoro-82M stack).
+"""ONE-TIME voice enrollment for ULTRON (Kokoro-82M stack).
 
 Straight answer to "can it learn my 15 s Ultron clip?":
 - Parakeet (STT) is a recognition model - it cannot mimic a voice.
@@ -37,7 +37,7 @@ import sys
 import time
 from pathlib import Path
 
-import iris_config as cfg
+import ultron_config as cfg
 
 CHECK_LINE = "Voice check complete. There are no strings on me."
 
@@ -58,7 +58,7 @@ def decode_audio(path: Path):
         pass
     import subprocess
 
-    tmp = cfg.IRIS_DIR / "voice_prompt_decoded.wav"
+    tmp = cfg.ULTRON_DIR / "voice_prompt_decoded.wav"
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path), "-ac", "1", str(tmp)],
         check=True,
@@ -136,7 +136,7 @@ def enroll(reference_wav: Path, transcript: str):
 
 # ------------------------------------------------------------------ main
 def main() -> int:
-    ap = argparse.ArgumentParser(description="One-time IRIS voice enrollment (Kokoro stack)")
+    ap = argparse.ArgumentParser(description="One-time ULTRON voice enrollment (Kokoro stack)")
     ap.add_argument("--force", action="store_true", help="re-enroll even if a voice exists")
     ap.add_argument("--transcript", default="", help="exact words spoken in the clip (bypasses ASR)")
     ap.add_argument("--voice", default="", help="built-in voice for static fallback (default bm_george)")
@@ -169,7 +169,7 @@ def main() -> int:
         print("      WARNING: enrollment works best with 3-30 s of clean single-speaker audio")
 
     # persist a decoded wav (pykokoro reads files; also reusable)
-    ref_wav = cfg.IRIS_DIR / "voice_prompt_24k.wav"
+    ref_wav = cfg.ULTRON_DIR / "voice_prompt_24k.wav"
     try:
         import soundfile as sf
 
@@ -231,7 +231,7 @@ def main() -> int:
             if tts is not None:
                 check_audio, check_sr = tts.synth(CHECK_LINE)
                 if len(check_audio):
-                    sf.write(str(cfg.IRIS_DIR / "voice_check.wav"), check_audio, check_sr)
+                    sf.write(str(cfg.ULTRON_DIR / "voice_check.wav"), check_audio, check_sr)
                     print("      voice_check.wav written - listen to audition the voice")
         except Exception as e:
             print(f"      voice check skipped ({type(e).__name__}: {e})")

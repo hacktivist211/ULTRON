@@ -251,7 +251,7 @@ class GpuEmbeddings(Embeddings):
         import torch
         from sentence_transformers import SentenceTransformer
 
-        # Default is CPU: the primary IRIS runtime (llama-server + Kokoro TTS)
+        # Default is CPU: the primary ULTRON runtime (llama-server + Kokoro TTS)
         # owns the 6 GB GPU, and this index is shared with it. To use the GPU
         # for embedding sessions with the LLM server stopped, set
         # CRAG_EMBED_DEVICE=cuda. Changing the device never invalidates the

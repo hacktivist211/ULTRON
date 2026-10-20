@@ -9,7 +9,7 @@ import time
 
 import numpy as np
 
-import iris_config as cfg
+import ultron_config as cfg
 import stt_engine
 import tool_runtime
 import tts_engine

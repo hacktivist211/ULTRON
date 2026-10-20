@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""IRIS shared configuration.
+"""ULTRON shared configuration.
 
 Design rules for this project:
   - FLAT files only: every artifact this module and its siblings create lives
-    directly in the IRIS folder (the directory containing this file). No nested
+    directly in the ULTRON folder (the directory containing this file). No nested
     directories are ever created.
   - Secrets live in a `.env` file next to this module. They are loaded into the
     environment, never printed, and never written into code or logs.
   - Every module resolves paths relative to this file, so you can drop the whole
-    set into ~/Documents/IRIS and it just works.
+    set into ~/Documents/ULTRON and it just works.
 
 Override anything with environment variables or the `.env` file:
   TAVILY_API_KEY=tvly-...            (required for Tavily web search)
@@ -34,20 +34,20 @@ Override anything with environment variables or the `.env` file:
   BOOT_GREETING="I am online. There are no strings on me."
   TAVILY_TIMEOUT=9.0                 (seconds, fillers cover this latency)
   TAVILY_INCLUDE_ANSWER=true         (Tavily's synthesized answer: great for speech)
-  IRIS_HISTORY_TURNS=24              (conversation history bound: max messages)
-  IRIS_HISTORY_CHARS=24000           (history bound: max total characters)
-  IRIS_TRIM_HISTORY=1                (0 disables automatic trimming)
-  IRIS_RETRY_CONNECT=1               (bounded connection retries in chat())
-  IRIS_STREAM_USAGE=0                (1 = request token usage in the SSE stream;
+  ULTRON_HISTORY_TURNS=24              (conversation history bound: max messages)
+  ULTRON_HISTORY_CHARS=24000           (history bound: max total characters)
+  ULTRON_TRIM_HISTORY=1                (0 disables automatic trimming)
+  ULTRON_RETRY_CONNECT=1               (bounded connection retries in chat())
+  ULTRON_STREAM_USAGE=0                (1 = request token usage in the SSE stream;
                                       needs a llama.cpp build that supports it)
 
 MEMORY MAP (who owns which store - all paths are module-relative, never CWD):
   memory.db               durable personal memory, owned by memory_store.py
                           (AUTHORITATIVE for user facts; used by the primary
                           voice runtime and memory_import.py)
-  iris_memory/
+  ultron_memory/
     temporal_memory.db    episodic turn log, owned by temporal_memory.py in the
-                          CRAG stack (legacy name iris_memory/memory.db is
+                          CRAG stack (legacy name ultron_memory/memory.db is
                           migrated automatically, original kept as backup)
     visual_memory/*.png   human-readable visual archive of the same turns
   crag_vector_store/      ChromaDB document index, owned by retrieval.py in the
@@ -61,12 +61,12 @@ import os
 import re
 from pathlib import Path
 
-IRIS_DIR = Path(__file__).resolve().parent
+ULTRON_DIR = Path(__file__).resolve().parent
 
 
 def load_dotenv(path: str | Path | None = None, override: bool = False) -> int:
     """Tiny .env loader (no external dependency). Returns number of keys set."""
-    p = Path(path) if path else IRIS_DIR / ".env"
+    p = Path(path) if path else ULTRON_DIR / ".env"
     if not p.exists():
         return 0
     n = 0
@@ -95,9 +95,9 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", LLM_MODEL_NAME)
 
 # Qwen3.5 emits a reasoning/thinking phase by default. That adds latency and,
 # for short control calls (grading/refine/rewrite) and streamed replies, can
-# consume the whole token budget before any answer appears. IRIS turns it off
-# through the chat template unless IRIS_ENABLE_THINKING=1 is set.
-LLM_ENABLE_THINKING = os.environ.get("IRIS_ENABLE_THINKING", "0").lower() in (
+# consume the whole token budget before any answer appears. ULTRON turns it off
+# through the chat template unless ULTRON_ENABLE_THINKING=1 is set.
+LLM_ENABLE_THINKING = os.environ.get("ULTRON_ENABLE_THINKING", "0").lower() in (
     "1", "true", "yes", "on"
 )
 
@@ -113,7 +113,7 @@ TAVILY_INCLUDE_ANSWER = os.environ.get("TAVILY_INCLUDE_ANSWER", "true").lower() 
 # runs without the heavy nemo_toolkit dependency. Override STT_MODEL with any
 # transformers-format repo if you prefer.
 STT_MODEL = os.environ.get("STT_MODEL", "nvidia/parakeet-tdt-0.6b-v3").strip()
-STT_LOCAL_DIR = IRIS_DIR / os.environ.get("STT_LOCAL_DIR", "models/parakeet-tdt-0.6b-v3")
+STT_LOCAL_DIR = ULTRON_DIR / os.environ.get("STT_LOCAL_DIR", "models/parakeet-tdt-0.6b-v3")
 STT_DEVICE = os.environ.get("STT_DEVICE", "auto").strip().lower()
 STT_SAMPLE_RATE = 16000
 try:
@@ -122,7 +122,7 @@ except ValueError:
     STT_VRAM_MIN_MB = 1800
 
 # ---------------------------------------------------------------- Voice / TTS (Kokoro-82M)
-VOICE_SAMPLE = IRIS_DIR / os.environ.get("VOICE_SAMPLE", "ultron_voice_sample.mp3")
+VOICE_SAMPLE = ULTRON_DIR / os.environ.get("VOICE_SAMPLE", "ultron_voice_sample.mp3")
 FILLER_LINES = [
     "Patience, creator.",
     "Compiling.",
@@ -133,25 +133,25 @@ TTS_SAMPLE_RATE = 24000                                  # Kokoro native rate (s
 TTS_ENGINE = os.environ.get("TTS_ENGINE", "auto").strip().lower()   # auto|pykokoro|kokoro|none
 TTS_VOICE = os.environ.get("TTS_VOICE", "bm_george").strip()        # British male; am_onyx = colder
 TTS_VOICE_MODE = os.environ.get("TTS_VOICE_MODE", "static").strip().lower()  # static|reference|pack
-TTS_REFERENCE_VOICE = IRIS_DIR / os.environ.get("TTS_REFERENCE_VOICE", "ultron_reference.npz")
-TTS_VOICE_PACK = IRIS_DIR / os.environ.get("TTS_VOICE_PACK", "ultron_pack.npz")
+TTS_REFERENCE_VOICE = ULTRON_DIR / os.environ.get("TTS_REFERENCE_VOICE", "ultron_reference.npz")
+TTS_VOICE_PACK = ULTRON_DIR / os.environ.get("TTS_VOICE_PACK", "ultron_pack.npz")
 TTS_LANG = os.environ.get("TTS_LANG", "").strip().lower()  # "" = auto: bm_/bf_ -> en-gb, else en-us
 try:
     TTS_SPEED = min(2.0, max(0.5, float(os.environ.get("TTS_SPEED", "1.0"))))
 except ValueError:
     TTS_SPEED = 1.0
 TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "auto").strip().lower()  # auto|cuda|cpu
-MODELS_DIR = IRIS_DIR / os.environ.get("MODELS_DIR", "models")         # download_models.py target
+MODELS_DIR = ULTRON_DIR / os.environ.get("MODELS_DIR", "models")         # download_models.py target
 ONNXVOICE_CACHE_DIR = os.environ.get("ONNXVOICE_CACHE_DIR", "")        # Kokoro asset store root
 # ONNXVOICE_CACHE_DIR must be in the environment before onnxvoice resolves
 # assets. load_dotenv() above already exported it when download_models.py
-# wrote it, so every IRIS process picks the stored assets up automatically.
+# wrote it, so every ULTRON process picks the stored assets up automatically.
 
 # ---------------------------------------------------------------- Spoken output budgets
 WORD_BUDGETS = {"quick": 25, "standard": 60, "detailed": 150}
 
 # ---------------------------------------------------------------- Memory
-MEMORY_DB = IRIS_DIR / os.environ.get("MEMORY_DB", "memory.db")
+MEMORY_DB = ULTRON_DIR / os.environ.get("MEMORY_DB", "memory.db")
 EMBED_BATCH = 32
 
 # ---------------------------------------------------------------- Streaming / history / retry
@@ -164,23 +164,23 @@ def _env_float(name: str, default: float) -> float:
 
 
 LLM_TIMEOUT = (
-    _env_float("IRIS_TIMEOUT_CONNECT", 5.0),
-    _env_float("IRIS_TIMEOUT_READ", 180.0),
+    _env_float("ULTRON_TIMEOUT_CONNECT", 5.0),
+    _env_float("ULTRON_TIMEOUT_READ", 180.0),
 )
-HISTORY_TRIM = os.environ.get("IRIS_TRIM_HISTORY", "1").lower() not in ("0", "false", "off", "no")
+HISTORY_TRIM = os.environ.get("ULTRON_TRIM_HISTORY", "1").lower() not in ("0", "false", "off", "no")
 try:
-    HISTORY_TURNS = max(2, int(os.environ.get("IRIS_HISTORY_TURNS", "24")))
+    HISTORY_TURNS = max(2, int(os.environ.get("ULTRON_HISTORY_TURNS", "24")))
 except ValueError:
     HISTORY_TURNS = 24
 try:
-    HISTORY_CHARS = max(1000, int(os.environ.get("IRIS_HISTORY_CHARS", "24000")))
+    HISTORY_CHARS = max(1000, int(os.environ.get("ULTRON_HISTORY_CHARS", "24000")))
 except ValueError:
     HISTORY_CHARS = 24000
 try:
-    RETRY_CONNECT = max(0, int(os.environ.get("IRIS_RETRY_CONNECT", "1")))
+    RETRY_CONNECT = max(0, int(os.environ.get("ULTRON_RETRY_CONNECT", "1")))
 except ValueError:
     RETRY_CONNECT = 1
-STREAM_USAGE = os.environ.get("IRIS_STREAM_USAGE", "0").lower() in ("1", "true", "yes", "on")
+STREAM_USAGE = os.environ.get("ULTRON_STREAM_USAGE", "0").lower() in ("1", "true", "yes", "on")
 
 # ---------------------------------------------------------------- Embedding backend
 EMBED_BACKEND = os.environ.get("EMBED_BACKEND", "llamaserver").strip().lower()
@@ -195,7 +195,7 @@ def update_env_file(updates: dict, env_path: str | Path | None = None) -> list:
     with mode 600 when absent. Its contents are never printed (the file may
     hold secrets). Returns the sorted list of keys written.
     """
-    p = Path(env_path) if env_path else IRIS_DIR / ".env"
+    p = Path(env_path) if env_path else ULTRON_DIR / ".env"
     lines: list[str] = []
     if p.exists():
         lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -263,7 +263,7 @@ def human_date(ts: float | None) -> str:
 def profile_summary() -> dict:
     """Snapshot of key config for logging (secrets are never included)."""
     return {
-        "iris_dir": str(IRIS_DIR),
+        "ultron_dir": str(ULTRON_DIR),
         "llama_server": LLAMA_SERVER_URL,
         "embed_endpoint": EMBED_ENDPOINT,
         "tavily_key_present": bool(TAVILY_API_KEY),

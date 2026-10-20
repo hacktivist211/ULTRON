@@ -25,7 +25,7 @@ BANNER = """
 ================================================================
   Self-Corrective RAG (CRAG) with Temporal Memory
   llm backend : {backend}
-                (the same llama-server as the primary IRIS runtime;
+                (the same llama-server as the primary ULTRON runtime;
                  no second model is ever loaded; Ollama stays off)
   embeddings  : BAAI/bge-m3, cpu by default (CRAG_EMBED_DEVICE=cuda
                 for standalone GPU sessions with the LLM server stopped)
@@ -268,7 +268,7 @@ def run_crag_pipeline(query, engine, memory, top_k=TOP_K, ef=None, verbose=True)
 
     # 6. generation with lost-in-the-middle packing and the TIME block
     log(f"generating answer from {len(context_blocks)} context block(s) [{mode}]")
-    print("\nIRIS: ", end="", flush=True)
+    print("\nULTRON: ", end="", flush=True)
     collected = []
     for token in generate_answer(query, context_blocks, temporal_note=temporal_note, mode=mode):
         sys.stdout.write(token)
@@ -372,7 +372,7 @@ def main():
         print(f"last interaction      : {last_interaction['human']}")
         if last_interaction["seconds"] > 3600:
             print(
-                f"[iris] welcome back, it has been {last_interaction['human']} "
+                f"[ultron] welcome back, it has been {last_interaction['human']} "
                 "since your last interaction."
             )
     print(
@@ -390,13 +390,13 @@ def main():
             print()
             query = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nIRIS: goodbye.")
+            print("\nULTRON: goodbye.")
             break
         if not query:
             continue
         lowered = query.lower()
         if lowered in {"exit", "quit", "/exit", "/quit", "bye"}:
-            print("IRIS: goodbye.")
+            print("ULTRON: goodbye.")
             break
         if lowered == "/menu":
             _choose_ingestion(engine)
@@ -414,7 +414,7 @@ def main():
         if lowered == "/memory":
             turns = memory.recent_turns(10)
             if not turns:
-                print("[iris] no interactions recorded yet")
+                print("[ultron] no interactions recorded yet")
             else:
                 for turn in turns:
                     print(f"[{turn['when']}] You: {turn['query']}")
@@ -422,7 +422,7 @@ def main():
                     if answer:
                         preview = answer[:70]
                         tail = "..." if len(answer) > 70 else ""
-                        print(f"    IRIS: {preview}{tail}")
+                        print(f"    ULTRON: {preview}{tail}")
             continue
         if lowered.startswith("/forget"):
             parts = lowered.split()
@@ -431,7 +431,7 @@ def main():
                 print("usage: /forget last | /forget all")
             else:
                 deleted = memory.forget(scope)
-                print(f"[iris] forgot {deleted} turn(s)")
+                print(f"[ultron] forgot {deleted} turn(s)")
             continue
         try:
             run_crag_pipeline(query, engine, memory, top_k=args.k, ef=args.ef, verbose=verbose)
@@ -439,7 +439,7 @@ def main():
             print("\n[crag] interrupted")
         except Exception as error:
             print(f"\n[crag] pipeline error: {error}")
-            print("IRIS: something went wrong while processing that question. Please try rephrasing it.")
+            print("ULTRON: something went wrong while processing that question. Please try rephrasing it.")
 
 
 if __name__ == "__main__":

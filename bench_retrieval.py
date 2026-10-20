@@ -37,7 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import iris_config as cfg  # noqa: E402
+import ultron_config as cfg  # noqa: E402
 
 FACTS = [
     ("gpu", "My laptop has an NVIDIA RTX 4050 with 6 GB VRAM.", 0.9),
@@ -138,7 +138,7 @@ def evaluate(store, k_max: int = 5, verbose=True) -> dict:
 def build_store(backend: str | None):
     import memory_store
 
-    tmp = Path(tempfile.mkdtemp(prefix="iris_bench_"))
+    tmp = Path(tempfile.mkdtemp(prefix="ultron_bench_"))
     store = memory_store.MemoryStore(db_path=str(tmp / "bench.db"), embed_backend=backend)
     store.add_many(
         [{"content": text, "speaker": "user", "source": "bench", "importance": imp}
@@ -154,7 +154,7 @@ def main() -> int:
                     help="benchmark llama-server vs sbert backends")
     args = ap.parse_args()
 
-    print("IRIS retrieval benchmark")
+    print("ULTRON retrieval benchmark")
     print("=" * 60)
 
     if args.fake:

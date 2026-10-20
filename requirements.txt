@@ -1,11 +1,11 @@
 # ============================================================================
-# IRIS — Kokoro-82M + Parakeet TDT voice stack
+# ULTRON — Kokoro-82M + Parakeet TDT voice stack
 # Python 3.11, Fedora 44, RTX 4050 Max-Q 6 GB, CUDA 12.4
 #
 # IMPORTANT: these pins target Python 3.11. The conda *base* env here is
 # Python 3.14, which has no torch 2.6.0+cu124 wheel (hence "No matching
 # distribution found"). Always install inside the 3.11 env:
-#   conda activate iris && pip install -r requirements.txt
+#   conda activate ultron && pip install -r requirements.txt
 #
 # System packages FIRST (Fedora):
 #   sudo dnf install -y espeak-ng ffmpeg

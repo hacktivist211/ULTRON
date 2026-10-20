@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Tavily web search for IRIS (live web data for the assistant).
+"""Tavily web search for ULTRON (live web data for the assistant).
 
 Integration approach (per Tavily build-path guidance):
   - Uses the official `tavily-python` SDK when installed, and falls back to a
     direct REST call so the module has zero hard dependencies.
-  - Reads TAVILY_API_KEY from the environment / .env (via iris_config).
+  - Reads TAVILY_API_KEY from the environment / .env (via ultron_config).
     The key is never printed, logged, or embedded in error messages.
   - If no key is configured it automatically uses Tavily keyless access
     (X-Tavily-Access-Mode: keyless). Keyless is rate-limited but proves the
@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 
 import requests
 
-import iris_config as cfg
+import ultron_config as cfg
 
 
 class TavilyError(RuntimeError):

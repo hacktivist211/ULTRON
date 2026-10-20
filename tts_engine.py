@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""IRIS TTS - Kokoro-82M: pykokoro primary, official kokoro fallback.
+"""ULTRON TTS - Kokoro-82M: pykokoro primary, official kokoro fallback.
 
 Both engines speak the same contract - text in, float32 mono 24 kHz out -
 so every call site (ultron.py reply path, voice_cache fillers, enrollment
@@ -33,7 +33,7 @@ import sys
 import tempfile
 import time
 
-import iris_config as cfg
+import ultron_config as cfg
 
 SAMPLE_RATE = 24000  # Kokoro native rate (both engines)
 
@@ -261,7 +261,7 @@ class KokoroTTS:
         return cfg.TTS_VOICE
 
     def _load_pykokoro(self):
-        # .env ONNXVOICE_CACHE_DIR was exported by iris_config.load_dotenv();
+        # .env ONNXVOICE_CACHE_DIR was exported by ultron_config.load_dotenv();
         # re-set it defensively in case something cleared the environment.
         if cfg.ONNXVOICE_CACHE_DIR:
             import os
@@ -391,7 +391,7 @@ _ERR = ""
 
 def get_tts() -> KokoroTTS | None:
     """Process-wide singleton. None (with one stderr note) when no engine is
-    importable - IRIS continues text-only, it never crashes."""
+    importable - ULTRON continues text-only, it never crashes."""
     global _TTS, _ERR
     if _TTS is not None:
         return _TTS
@@ -405,7 +405,7 @@ def get_tts() -> KokoroTTS | None:
     else:
         _ERR = "no TTS engine importable"
         print('[tts] unavailable (pip install "pykokoro[gpu]" or kokoro). '
-              "IRIS continues text-only.", file=sys.stderr)
+              "ULTRON continues text-only.", file=sys.stderr)
         return None
     return _TTS
 

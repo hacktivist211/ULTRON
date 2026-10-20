@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GPU / VRAM / system-RAM sampler for IRIS benchmarks (Critical Issue 7/10).
+# GPU / VRAM / system-RAM sampler for ULTRON benchmarks (Critical Issue 7/10).
 #
 #   ./monitor_gpu.sh              # 1 s interval, run until Ctrl+C
 #   ./monitor_gpu.sh 5            # sample every 5 s

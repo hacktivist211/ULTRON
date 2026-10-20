@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# IRIS llama-server launcher - Qwen3.5-4B via llama.cpp (never Ollama).
+# ULTRON llama-server launcher - Qwen3.5-4B via llama.cpp (never Ollama).
 #
 # This is YOUR exact working command with the flags below added:
 #   --embeddings   -> serves /v1/embeddings so memory_store.py can embed
@@ -15,7 +15,7 @@
 #                     (Request-level chat_template_kwargs in tool_runtime.py /
 #                     evaluator_router.py are a second, independent belt.)
 #
-#   --no-mmproj  -> do NOT load the vision/CLIP projector. IRIS never sends
+#   --no-mmproj  -> do NOT load the vision/CLIP projector. ULTRON never sends
 #                     images to the LLM (no image_url payloads anywhere; the
 #                     --vision OCR flag in main.py is never read), but Qwen3.5
 #                     is a VL model, so llama.cpp otherwise auto-loads a
@@ -44,20 +44,20 @@
 #
 # This repo also ships mmproj-*.gguf files (it is a VL model too), so
 # --no-mmproj below matters here: it prevents llama.cpp from downloading and
-# loading a ~650 MB vision projector that IRIS never uses.
+# loading a ~650 MB vision projector that ULTRON never uses.
 #
 # What this wrapper adds around the server itself:
 #   - pre-flight: binary exists, port not already serving, ~free VRAM shown
 #   - waits up to 120 s for /health, then prints READY + endpoints
 #   - Ctrl+C / SIGTERM: server shut down cleanly, exit code reported
 #   - tunables via environment variables (defaults = your values):
-#       IRIS_LLAMA_BIN  path to llama-server     (~/llama.cpp/build/bin/llama-server)
-#       IRIS_LLAMA_DIR  llama.cpp checkout       (~/llama.cpp)
-#       IRIS_MODEL      -hf model repo            (mradermacher/Qwen3.5-4B_Abliterated-GGUF:Q4_K_M)
-#       IRIS_PORT       listen port               (8080)
-#       IRIS_HOST       bind address              (127.0.0.1)
-#       IRIS_CTX        context size              (16384)
-#       IRIS_WAIT_S     health-wait timeout       (120)
+#       ULTRON_LLAMA_BIN  path to llama-server     (~/llama.cpp/build/bin/llama-server)
+#       ULTRON_LLAMA_DIR  llama.cpp checkout       (~/llama.cpp)
+#       ULTRON_MODEL      -hf model repo            (mradermacher/Qwen3.5-4B_Abliterated-GGUF:Q4_K_M)
+#       ULTRON_PORT       listen port               (8080)
+#       ULTRON_HOST       bind address              (127.0.0.1)
+#       ULTRON_CTX        context size              (16384)
+#       ULTRON_WAIT_S     health-wait timeout       (120)
 #
 # Memory tool calls need --jinja (you already have it).
 # If VRAM ever gets tight with the STT/TTS models beside it, try adding:
@@ -68,13 +68,13 @@
 
 set -u
 
-LLAMA_DIR="${IRIS_LLAMA_DIR:-$HOME/llama.cpp}"
-LLAMA_BIN="${IRIS_LLAMA_BIN:-$LLAMA_DIR/build/bin/llama-server}"
-MODEL="${IRIS_MODEL:-mradermacher/Qwen3.5-4B_Abliterated-GGUF:Q4_K_M}"
-PORT="${IRIS_PORT:-8080}"
-HOST_="${IRIS_HOST:-127.0.0.1}"
-CTX="${IRIS_CTX:-16384}"
-WAIT_S="${IRIS_WAIT_S:-120}"
+LLAMA_DIR="${ULTRON_LLAMA_DIR:-$HOME/llama.cpp}"
+LLAMA_BIN="${ULTRON_LLAMA_BIN:-$LLAMA_DIR/build/bin/llama-server}"
+MODEL="${ULTRON_MODEL:-mradermacher/Qwen3.5-4B_Abliterated-GGUF:Q4_K_M}"
+PORT="${ULTRON_PORT:-8080}"
+HOST_="${ULTRON_HOST:-127.0.0.1}"
+CTX="${ULTRON_CTX:-16384}"
+WAIT_S="${ULTRON_WAIT_S:-120}"
 
 say() { printf '[llama] %s\n' "$*"; }
 die() { printf '[llama] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -82,7 +82,7 @@ die() { printf '[llama] ERROR: %s\n' "$*" >&2; exit 1; }
 # ---------------------------------------------------------------- pre-flight
 [ -x "$LLAMA_BIN" ] || die "llama-server not found at $LLAMA_BIN
        build it first:  cd $LLAMA_DIR && cmake -B build && cmake --build build -j
-       or override:     IRIS_LLAMA_BIN=/path/to/llama-server ./start_llama.sh"
+       or override:     ULTRON_LLAMA_BIN=/path/to/llama-server ./start_llama.sh"
 
 if command -v curl >/dev/null 2>&1; then
     if curl -fsS -m 3 "http://$HOST_:$PORT/health" >/dev/null 2>&1; then

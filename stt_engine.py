@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""IRIS STT - NVIDIA Parakeet TDT 0.6B (transformers-native, v3).
+"""ULTRON STT - NVIDIA Parakeet TDT 0.6B (transformers-native, v3).
 
 FastConformer-TDT, ~600M params: RTFx in the thousands on GPU, punctuation
 and capitalization baked in, robust to noise. Loaded through transformers
@@ -38,7 +38,7 @@ import sys
 import time
 from pathlib import Path
 
-import iris_config as cfg
+import ultron_config as cfg
 
 _STT = None   # singleton ParakeetSTT
 _ERR = ""     # cached load failure (reported once, degrades to text-only)
@@ -127,7 +127,7 @@ def load_audio_file(path: str | Path):
     import subprocess
     import tempfile
 
-    tmp = Path(tempfile.gettempdir()) / f"{p.stem}_iris16k.wav"
+    tmp = Path(tempfile.gettempdir()) / f"{p.stem}_ultron16k.wav"
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", str(p),
          "-ac", "1", "-ar", str(cfg.STT_SAMPLE_RATE), str(tmp)],
@@ -241,7 +241,7 @@ class ParakeetSTT:
 
 def get_stt() -> ParakeetSTT | None:
     """Process-wide singleton. Returns None (one stderr note) when the model
-    cannot load - IRIS degrades to text input, it never crashes."""
+    cannot load - ULTRON degrades to text input, it never crashes."""
     global _STT, _ERR
     if _STT is not None:
         return _STT

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live integration tests for IRIS (Critical Issue 9, category C/D).
+"""Live integration tests for ULTRON (Critical Issue 9, category C/D).
 
 Each test prints [PASS], [FAIL], or [SKIP (requires ...)] so it is always
 clear what was actually executed on THIS machine versus what needs your
@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import requests
 
-import iris_config as cfg
+import ultron_config as cfg
 import tool_runtime as tr
 
 RESULTS = []
@@ -42,7 +42,7 @@ def record(name, status, detail=""):
 
 
 def temp_db(name: str) -> Path:
-    tmp = Path(tempfile.mkdtemp(prefix="iris_it_"))
+    tmp = Path(tempfile.mkdtemp(prefix="ultron_it_"))
     return tmp / name
 
 
@@ -325,12 +325,12 @@ def test_voice(do_voice):
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="IRIS live integration tests")
+    ap = argparse.ArgumentParser(description="ULTRON live integration tests")
     ap.add_argument("--no-web", action="store_true")
     ap.add_argument("--no-voice", action="store_true")
     args = ap.parse_args()
 
-    print("IRIS integration tests  (executed-vs-skipped is always explicit)")
+    print("ULTRON integration tests  (executed-vs-skipped is always explicit)")
     print("=" * 64)
     server_up = False
     try:

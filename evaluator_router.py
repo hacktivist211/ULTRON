@@ -30,8 +30,8 @@ except ValueError:
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 EVALUATOR_MODEL = os.getenv("CRAG_CONTROL_MODEL") or os.getenv("CRAG_MODEL", "gemma4:e4b")
 
-# Mirror iris_config.LLM_ENABLE_THINKING for the standalone CRAG CLI.
-LLAMA_ENABLE_THINKING = os.getenv("IRIS_ENABLE_THINKING", "0").strip().lower() in (
+# Mirror ultron_config.LLM_ENABLE_THINKING for the standalone CRAG CLI.
+LLAMA_ENABLE_THINKING = os.getenv("ULTRON_ENABLE_THINKING", "0").strip().lower() in (
     "1", "true", "yes", "on"
 )
 
@@ -117,7 +117,7 @@ GREETING_RE = re.compile(
     r"see\s+you\s+later|talk\s+to\s+you\s+later|catch\s+you\s+later|later|"
     r"ok|okay|k|cool|nice|great|awesome|perfect|got\s+it|gotcha|understood|wow|lol|haha|"
     r"hehe|np|no\s+problem|welcome)"
-    r"\b(?:\s+(?:there|everyone|everybody|guys|folks|iris))?[!.,?~\s]*$",
+    r"\b(?:\s+(?:there|everyone|everybody|guys|folks|ultron))?[!.,?~\s]*$",
     re.IGNORECASE,
 )
 

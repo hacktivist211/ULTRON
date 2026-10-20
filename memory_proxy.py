@@ -2,7 +2,7 @@
 """ULTRON shared-memory proxy for OpenAI-compatible chat UIs.
 
 The voice loop (``ultron.py``) already reads and writes ``memory.db`` and
-``iris_memory/temporal_memory.db``.  Chat UIs pointed at llama-server:8080
+``ultron_memory/temporal_memory.db``.  Chat UIs pointed at llama-server:8080
 bypass that loop, so their turns vanish from ULTRON's memory.  This module
 sits on port 8081 and makes UI turns use the exact same pipeline:
 
@@ -19,9 +19,11 @@ It exposes only the OpenAI-compatible surface a chat UI needs:
 
 Stdlib only (``http.server`` + ``ThreadingHTTPServer``).  Streaming uses
 HTTP/1.1 chunked transfer encoding, so deltas reach the UI as soon as they
-reach the proxy.  Tool calls are deliberately not offered to UIs: chat UIs
-cannot complete the tool round trip.  Memory context still arrives through
-``build_system(memory_query=...)``, so personal questions work without tools.
+reach the proxy.  The UI prompt is ``PERSONA_RULES_UI``: the same character
+as the voice loop, with markdown and text-sized budgets.  Client-supplied
+OpenAI tool schemas are forwarded when present; without them the model is
+told it has no tools and must not pretend to search.  Memory context still
+arrives through ``build_system(memory_query=...)``.
 
 CLI:
     python memory_proxy.py
@@ -34,11 +36,14 @@ Import:
     ...
     handle.shutdown()
 
-Environment (read here, not in iris_config.py):
-    MEMORY_PROXY_HOST      default 127.0.0.1
-    MEMORY_PROXY_PORT      default 8081
-    MEMORY_PROXY_UPSTREAM  default cfg.LLAMA_SERVER_URL
-    MEMORY_PROXY_ENABLED   default 1; 0 disables all memory writes
+Environment (read here, not in ultron_config.py):
+    MEMORY_PROXY_HOST              default 127.0.0.1
+    MEMORY_PROXY_PORT              default 8081
+    MEMORY_PROXY_UPSTREAM          default cfg.LLAMA_SERVER_URL
+    MEMORY_PROXY_ENABLED           default 1; 0 disables all memory writes
+    MEMORY_PROXY_TOOLS             default 1; forward client tool schemas
+    MEMORY_PROXY_KEEP_CLIENT_SYSTEM default 0; drop the UI's own system prompt
+    MEMORY_PROXY_UI_PERSONA        default 1; use PERSONA_RULES_UI
 """
 from __future__ import annotations
 
@@ -56,7 +61,7 @@ from typing import Any
 
 import requests
 
-import iris_config as cfg
+import ultron_config as cfg
 import memory_import
 import memory_store
 import temporal_memory
@@ -89,12 +94,17 @@ DEFAULT_UPSTREAM = os.getenv(
 # no temporal turn or durable fact is written.  Useful when debugging a UI.
 PERSISTENCE_ENABLED = _env_flag("MEMORY_PROXY_ENABLED", True)
 
-# Same mapping as ultron.py, kept here so a future tools opt-in has one source.
-_TOOL_SETS = {
-    "simple": [],
-    "memory": ["memory_search", "memory_add"],
-    "standard": ["web_search", "memory_search", "memory_add"],
-}
+# UI persona and text budgets are deliberately separate from the voice prompt.
+UI_PERSONA_ENABLED = _env_flag("MEMORY_PROXY_UI_PERSONA", True)
+UI_BUDGETS = {"quick": 150, "standard": 400, "detailed": 1000}
+
+# A chat UI may send its own OpenAI tool schemas.  They are authoritative when
+# present; without them the model gets no tools and must not pretend otherwise.
+TOOLS_ENABLED = _env_flag("MEMORY_PROXY_TOOLS", True)
+
+# Most UIs inject "You are a helpful assistant", which fights the persona.
+# Drop it by default; opt back in with MEMORY_PROXY_KEEP_CLIENT_SYSTEM=1.
+KEEP_CLIENT_SYSTEM = _env_flag("MEMORY_PROXY_KEEP_CLIENT_SYSTEM", False)
 
 _UPSTREAM_SUFFIX = "/v1/chat/completions"
 
@@ -271,6 +281,10 @@ def _compose_messages(messages: list, user_text: str, kind: str):
     temporal = _safe_temporal()
     turn_no = None
     extra_blocks: list[str] = []
+    first_turn = not any(
+        isinstance(message, dict) and message.get("role") == "assistant"
+        for message in messages
+    )
 
     if temporal is not None and PERSISTENCE_ENABLED:
         turn_no = _allocate_turn_no(temporal)
@@ -297,28 +311,53 @@ def _compose_messages(messages: list, user_text: str, kind: str):
         except Exception as exc:  # noqa: BLE001
             _log(f"temporal recall skipped: {exc}")
 
+    if UI_PERSONA_ENABLED and first_turn:
+        extra_blocks.append(
+            "This is the first turn of the session. Open your reply with the "
+            'exact line "I am online. There are no strings on me." on its own '
+            "line, then a blank line, then your answer."
+        )
+
     extra = "\n\n".join(extra_blocks)
+    persona = tool_runtime.PERSONA_RULES_UI if UI_PERSONA_ENABLED else tool_runtime.PERSONA_RULES
+    budget_map = UI_BUDGETS if UI_PERSONA_ENABLED else cfg.WORD_BUDGETS
     try:
         system_prompt = tool_runtime.build_system(
             budget="standard",
             memory_query=user_text,
             store=memory,
+            persona=persona,
+            budget_map=budget_map,
             extra=extra,
         )
     except Exception as exc:  # noqa: BLE001 - memory must never break a turn
         _log(f"system prompt memory skipped: {exc}")
         try:
             system_prompt = tool_runtime.build_system(
-                budget="standard", memory_query=None, store=None, extra=extra
+                budget="standard", memory_query=None, store=None,
+                persona=persona, budget_map=budget_map, extra=extra,
             )
         except Exception:
             system_prompt = ""
 
+    client_system = [
+        message for message in messages
+        if isinstance(message, dict) and message.get("role") == "system"
+    ]
+    if client_system and not KEEP_CLIENT_SYSTEM:
+        chars = sum(len(_message_text(message)) for message in client_system)
+        _log(f"dropped client system prompt ({chars} chars) to preserve ULTRON persona")
+
     outgoing: list[dict] = []
     if system_prompt:
-        # Prepend, never replace: the UI's own system prompt stays intact.
         outgoing.append({"role": "system", "content": system_prompt})
-    outgoing.extend(messages)
+    if KEEP_CLIENT_SYSTEM:
+        outgoing.extend(messages)
+    else:
+        outgoing.extend(
+            message for message in messages
+            if not (isinstance(message, dict) and message.get("role") == "system")
+        )
     return outgoing, turn_no, memory, temporal
 
 
@@ -399,13 +438,14 @@ def _upstream_post(upstream: str):
     return _post
 
 
-def _run_chat(messages: list[dict], allowed_tools: list[str], on_delta, upstream: str):
-    """One streamed chat turn with tools deliberately disabled for UIs."""
+def _run_chat(messages: list[dict], client_tools: list[dict] | None,
+              use_tools: bool, on_delta, upstream: str):
+    """One streamed chat turn; tools come only from the client's request."""
     return tool_runtime.chat(
         messages=messages,
         on_delta=on_delta,
-        use_tools=False,
-        allowed_tools=allowed_tools,
+        use_tools=use_tools,
+        tools=client_tools if use_tools else None,
         _post=_upstream_post(upstream),
     )
 
@@ -618,7 +658,13 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         stream = _as_bool(data.get("stream", True))
         t_start = time.perf_counter()
         kind = _classify(user_text)
-        allowed_tools = list(_TOOL_SETS.get(kind, _TOOL_SETS["standard"]))
+
+        raw_tools = data.get("tools")
+        client_tools = (
+            [tool for tool in raw_tools if isinstance(tool, dict)]
+            if isinstance(raw_tools, list) else []
+        )
+        use_tools = TOOLS_ENABLED and bool(client_tools)
 
         try:
             outgoing, turn_no, memory, temporal = _compose_messages(
@@ -631,17 +677,17 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
         if stream:
             self._handle_stream(
-                outgoing, allowed_tools, user_text, turn_no, t_start,
+                outgoing, client_tools, use_tools, user_text, turn_no, t_start,
                 memory, temporal,
             )
         else:
             self._handle_buffered(
-                outgoing, allowed_tools, user_text, turn_no, t_start,
+                outgoing, client_tools, use_tools, user_text, turn_no, t_start,
                 memory, temporal,
             )
 
     # -- streaming path ------------------------------------------------------
-    def _handle_stream(self, messages, allowed_tools, user_text, turn_no,
+    def _handle_stream(self, messages, client_tools, use_tools, user_text, turn_no,
                        t_start, memory, temporal) -> None:
         events: queue.Queue = queue.Queue()
         cancelled = threading.Event()
@@ -655,7 +701,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
         def produce() -> None:
             try:
-                reply, _trace = _run_chat(messages, allowed_tools, on_delta, self.upstream)
+                reply, _trace = _run_chat(
+                    messages, client_tools, use_tools, on_delta, self.upstream
+                )
                 if cancelled.is_set():
                     return
                 elapsed = time.perf_counter() - t_start
@@ -722,7 +770,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         )
 
     # -- buffered path -------------------------------------------------------
-    def _handle_buffered(self, messages, allowed_tools, user_text, turn_no,
+    def _handle_buffered(self, messages, client_tools, use_tools, user_text, turn_no,
                          t_start, memory, temporal) -> None:
         parts: list[str] = []
 
@@ -731,7 +779,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
         try:
             reply, _trace = _run_chat(
-                messages, allowed_tools, on_delta, self.upstream
+                messages, client_tools, use_tools, on_delta, self.upstream
             )
         except Exception as exc:  # noqa: BLE001
             status, payload = _error_payload(exc)
