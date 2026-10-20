@@ -1,4 +1,4 @@
-# ULTRON — Local Voice Assistant (`tts_loop_agent`)
+# ULTRON — Local Voice Assistant 
 
 A fully local, hardware-tuned voice stack for a 6 GB GPU: **Parakeet TDT STT →
 llama-server (Qwen3.5-4B) → Kokoro-82M TTS**, with genuine incremental
@@ -473,8 +473,8 @@ Hardware knobs when VRAM is tight:
 
 ```bash
 # 1. clone + enter
-git clone https://github.com/hacktivist211/tts_loop_agent.git
-cd tts_loop_agent
+git clone https://github.com/hacktivist211/.git
+cd 
 
 # 2. install Python deps (Python 3.11 only — 3.14 has no cu124 torch wheel)
 pip install -r requirements.txt
@@ -692,7 +692,7 @@ These are properties the code is written to preserve, and each one has a test in
 
 ## 16. Related repositories
 
-- **[`hacktivist211/modern-crag`](https://github.com/hacktivist211/modern-crag)** — the CRAG pipeline as a standalone CLI, with a CRAG-only `requirements.txt`. Shares `iris_config.py`, `tool_runtime.py`, `temporal_memory.py`, `evaluator_router.py`, `generator.py`, `retrieval.py`, `main.py`, `tavily_tool.py`, `memory_store.py`, `memory_import.py` byte-for-byte with this repo. Run CRAG research from `modern-crag` and voice from `tts_loop_agent` — both share the same `llama-server`.
+- **[`hacktivist211/modern-crag`](https://github.com/hacktivist211/modern-crag)** — the CRAG pipeline as a standalone CLI, with a CRAG-only `requirements.txt`. Shares `iris_config.py`, `tool_runtime.py`, `temporal_memory.py`, `evaluator_router.py`, `generator.py`, `retrieval.py`, `main.py`, `tavily_tool.py`, `memory_store.py`, `memory_import.py` byte-for-byte with this repo. Run CRAG research from `modern-crag` and voice from `` — both share the same `llama-server`.
 
 ## License
 
